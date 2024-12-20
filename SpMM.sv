@@ -29,6 +29,50 @@ module mul_(
     end
 endmodule
 
+// a naive adder tree
+module AdderTree #(parameter LENGTH = `N)(
+    input data_t add_ins[LENGTH-1:0],
+    output data_t sum_out
+);
+    localparam LENGTH_LEFT = LENGTH / 2;
+    localparam LENGTH_RIGHT = LENGTH - LENGTH_LEFT;
+    generate 
+        if (LENGTH == 1) begin
+            assign sum_out = add_ins[0];
+        end
+        else begin
+            // define left sub-tree and right sub-tree signals
+            data_t sum_out_left, sum_out_right;
+            data_t add_ins_left [LENGTH_LEFT-1:0];
+            data_t add_ins_right [LENGTH_RIGHT-1:0];
+            // input assignment
+            genvar i;
+            for(i = 0; i < LENGTH_LEFT; i++) begin
+                assign add_ins_left[i] = add_ins[i + LENGTH_RIGHT];
+            end
+            for(i = 0; i < LENGTH_RIGHT; i++) begin
+                assign add_ins_right[i] = add_ins[i];
+            end
+            // instatiating sub-modules
+            AdderTree #(
+                .LENGTH(LENGTH_LEFT)
+            ) subtree_left (
+                .add_ins(add_ins_left),
+                .sum_out(sum_out_left)
+            );
+            AdderTree #(
+                .LENGTH(LENGTH_RIGHT)
+            ) subtree_right (
+                .add_ins(add_ins_right),
+                .sum_out(sum_out_right)
+            );
+
+            assign sum_out = sum_out_left + sum_out_right;
+        end
+    endgenerate
+
+endmodule
+
 module RedUnit(
     input   logic               clock,
                                 reset,
@@ -44,8 +88,15 @@ module RedUnit(
     // delay 你需要自己为其赋值，表示电路的延迟
     assign delay = 0;
 
+    // 60 points assumption: only read one single line (split === 0)
+    // implement an adder tree
+    AdderTree #(.LENGTH(`N)) add_tree(
+        .add_ins(data),
+        .sum_out(out_data[0]) // ad_hoc for debug
+    );
+
     generate
-        for(genvar i = 0; i < `N; i++) begin
+        for(genvar i = 1; i < `N; i++) begin
             assign out_data[i] = 0;
         end
     endgenerate
