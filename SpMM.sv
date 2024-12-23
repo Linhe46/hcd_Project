@@ -4,6 +4,7 @@
 `define W               8
 `define lgN     ($clog2(`N))
 `define dbLgN (2*$clog2(`N))
+`define N2              `N*`N
 
 typedef struct packed { logic [`W-1:0] data; } data_t;
 
@@ -31,6 +32,7 @@ endmodule
 
 // a naive adder tree
 module AdderTree #(parameter LENGTH = `N)(
+    input clock,
     input data_t add_ins[LENGTH-1:0],
     output data_t sum_out
 );
@@ -57,17 +59,20 @@ module AdderTree #(parameter LENGTH = `N)(
             AdderTree #(
                 .LENGTH(LENGTH_LEFT)
             ) subtree_left (
+                .clock(clock),
                 .add_ins(add_ins_left),
                 .sum_out(sum_out_left)
             );
             AdderTree #(
                 .LENGTH(LENGTH_RIGHT)
             ) subtree_right (
+                .clock(clock),
                 .add_ins(add_ins_right),
                 .sum_out(sum_out_right)
             );
 
-            assign sum_out = sum_out_left + sum_out_right;
+            //assign sum_out = sum_out_left + sum_out_right;
+            add_ REG_ADDER (.clock(clock), .a(sum_out_left), .b(sum_out_right), .out(sum_out.data));
         end
     endgenerate
 
@@ -86,20 +91,23 @@ module RedUnit(
     // num_el 总是赋值为 N
     assign num_el = `N;
     // delay 你需要自己为其赋值，表示电路的延迟
-    assign delay = 0;
+    assign delay = `lgN; // delay is log_2(N) for an adder tree
 
     // 60 points assumption: only read one single line (split === 0)
     // implement an adder tree
     AdderTree #(.LENGTH(`N)) add_tree(
+        .clock(clock),
         .add_ins(data),
-        .sum_out(out_data[0]) // ad_hoc for debug
+        .sum_out(out_data[`N-1]) // for 60p cases, the checker's output_idx
     );
 
+/*
     generate
         for(genvar i = 1; i < `N; i++) begin
             assign out_data[i] = 0;
         end
     endgenerate
+*/
 endmodule
 
 module PE(
@@ -117,7 +125,69 @@ module PE(
     // num_el 总是赋值为 N
     assign num_el = `N;
     // delay 你需要自己为其赋值，表示电路的延迟
-    assign delay = 0;
+    assign delay = 4;
+    
+    // convert the CSR format matrix into readable form 
+    // split and output_idx definition
+    /*
+    logic split [`N-1:0];
+    logic [`lgN-1:0] out_idx[`N-1:0];
+    logic split_total [`N2-1:0];
+    generate
+        for(genvar i=1;i<`N;i++) begin
+            assign split_total[i] = 1;
+        end
+    endgenerate*/
+
+
+    logic [`lgN-1:0] cnt;
+    logic valid;
+    always_ff @(posedge clock) begin
+        if(reset)
+            cnt <= 0;
+        else if(lhs_start)
+            cnt <= cnt + 1;
+        else cnt <= cnt == 0 ? 0 : cnt + 1;
+    end
+    assign valid = cnt != 0;
+    
+
+    data_t data [`N-1:0];
+    data_t out_reg [`N-1:0];
+    RedUnit PE_REDUNIT(
+        .clock(clock),
+        .reset(reset),
+        .data(data),
+        .split(),
+        .out_idx(),
+        .out_data(out_reg)
+    );
+
+    // inner prodcut
+    generate
+        for(genvar i = 0; i < `N; i++)begin
+            mul_ DATA_MUL_UNIT(.clock(clock), .a(lhs_data[i]), .b(rhs[lhs_col[i]]), .out(data[i]));
+        end
+    endgenerate
+
+    always_ff @(posedge clock) begin
+        out[cnt] <= out_reg[`N-1];
+    end
+
+
+/*
+    generate
+        genvar i = 0;
+        for(i = 0; i < `N; i++) begin
+            assign ptr_normal[i] = ptr[i] - ptr_offset;
+        end
+        for(i = 0; i < `N; i++) begin
+            if(ptr_normal[i] < `N && ptr_normal[i] > 0) begin
+                split[ptr_normal[i]] = 1;
+            end
+            else
+                split[ptr_normal[i]] 
+                */
 
     generate
         for(genvar i = 0; i < `N; i++) begin
