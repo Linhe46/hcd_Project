@@ -8,6 +8,10 @@
 `define delayRedUnit   `lgN + 1
 `define delayPE        `lgN + 2
 
+`define Vector 0
+`define Buffer 1
+
+
 typedef struct packed { logic [`W-1:0] data; } data_t;
 
 module add_(
@@ -113,6 +117,53 @@ module RedUnit(
     end
 endmodule
 
+module StartDetector #(parameter Type = `Vector)(
+    input logic clock,
+    input logic reset,
+    input logic start,
+    output logic en,
+    output ctr
+);
+    generate
+        if(Type == `Buffer) begin
+            if(`N == 4) begin
+                assign en = start;
+            end
+            else begin 
+                logic started;
+                logic [`lgN-3:0] ctr_next, ctr;
+                assign en = start || started;
+                assign ctr_next = en ? ctr + 1 : ctr;
+                
+                always_ff @(posedge clock) begin
+                    if(reset) ctr <= 0;
+                    else ctr <= ctr_next;
+                end 
+                always_ff @(posedge clock) begin
+                    if(reset) started <= 0;
+                    else started <= start || (ctr != (`N/4-1) && ctr != 0); // 0 decided by start signal
+                end
+            end
+        end
+        else if(Type == `Vector) begin
+            logic started;
+            logic [`lgN-1:0] ctr_next, ctr;
+            assign en = start || started;
+            assign ctr_next = en ? ctr + 1 : ctr;
+            
+            always_ff @(posedge clock) begin
+                if(reset) ctr <= 0;
+                else ctr <= ctr_next;
+            end 
+            always_ff @(posedge clock) begin
+                if(reset) started <= 0;
+                else started <= start || (ctr != (`N-1) && ctr != 0); // 0 decided by start signal
+            end
+        end
+    endgenerate
+
+endmodule
+
 module PE(
     input   logic               clock,
                                 reset,
@@ -124,6 +175,7 @@ module PE(
     output  data_t              out[`N-1:0],
     output  int                 delay,
     output  int                 num_el
+    ,output lhs_en // used for SpMM ctrl
 );
     // num_el 总是赋值为 N
     assign num_el = `N;
@@ -132,67 +184,23 @@ module PE(
     //assign delay = `lgN + 2; // lgN+1 for RedUnit, 1 for inner product
     assign delay = `delayPE;
     
-    logic valid;
-    logic [`N-1:0] cnt;
-    logic [1:0] state, next_state;
-    localparam IDLE = 0, READING = 1;
-
-    always_ff @(posedge clock) begin
-        if(reset)
-            cnt <= 0;
-        else begin
-            case(state)
-                READING: cnt <= cnt + 1;
-                default: cnt <= cnt;
-            endcase
-        end
-    end
-
-    always_ff @(posedge clock) begin
-        if(reset)
-            state <= IDLE;
-        else 
-            state <= next_state;
-    end
-
-    always_comb begin
-        next_state = state;
-        case(state)
-            IDLE: begin
-                if (lhs_start)
-                    next_state = READING;
-            end
-            READING: begin
-                if (cnt == `N-1)
-                    next_state = IDLE;
-            end
-        endcase
-    end
-
-    assign valid = state == READING || lhs_start;
+    //logic lhs_en;
+    StartDetector #(.Type(`Vector)) lhs_detector(
+        .clock(clock),
+        .reset(reset),
+        .start(lhs_start),
+        .en(lhs_en),
+        .ctr()
+    );
 
     // convert the CSR format matrix into readable form 
     // split and output_idx definition
-
 
     logic split [`N-1:0];
     data_t data [`N-1:0];
     data_t out_reg [`N-1:0];
     logic [`lgN-1:0] out_idx [`N-1:0];
     
-/*
-    logic [`N-1:0] split_norm [`N-1:0];
-    
-    for (integer i=0;i<`N;i++) begin
-        always_ff @(posedge clock) begin
-            if(reset) begin
-                split[i] <= 0;
-                out_idx[i] <= 0;
-            end
-            else if(valid) begin
-                split
-        end
-*/
     // 60 pt out_idx
     always_comb begin
         for(int i = 0; i < `N; i++) begin
@@ -237,6 +245,32 @@ endmodule
         end \
     endtask
 
+`define START_DETECTOR(DETECTOR_NAME, TYPE, START, EN, CTR) \
+    logic EN; \
+    generate \
+        if(`N == 4) begin \
+            logic CTR; \
+            assign CTR = 0; \
+            StartDetector #(.Type(`TYPE)) DETECTOR_NAME( \
+                .clock(clock), \
+                .reset(reset), \
+                .start(START), \
+                .en(EN), \
+                .ctr() \
+            ); \
+        end \
+        else begin \
+            logic [`lgN-3:0] CTR; \
+            StartDetector #(.Type(`TYPE)) DETECTOR_NAME( \
+                .clock(clock), \
+                .reset(reset), \
+                .start(START), \
+                .en(EN), \
+                .ctr(CTR) \
+            ); \
+        end \
+    endgenerate
+
 module SpMM(
     input   logic               clock,
                                 reset,
@@ -271,111 +305,113 @@ module SpMM(
     //assign rhs_ready = 0;
     //assign out_ready = 0;
 
+    // detect the start signal
+    `START_DETECTOR(rhs_detector, Buffer, rhs_start, rhs_en, rhs_ctr)
+    //`START_DETECTOR(out_detector, Buffer, out_start, out_en, out_ctr)
+    `START_DETECTOR(out_detector, Buffer, out_start, out_en, out_ctr)
+
+    // ready logic
+    // lhs_ready_ns, rhs_ready and out_ready
+    localparam IDLE = 0, REC_RHS = 1, REC_LHS = 2, DONE = 3;
+    logic [2:0] input_state, next_input_state;
+    //assign rhs_ready = input_state == IDLE;
+    always_ff @(posedge clock) begin
+        if(reset) rhs_ready <= 0;
+        else rhs_ready <= input_state == IDLE && !rhs_start;
+    end
+    //assign lhs_ready_ns = input_state == REC_RHS && !rhs_en;
+    always_ff @(posedge clock) begin
+        if(reset) lhs_ready_ns <= 0;
+        else lhs_ready_ns <= input_state == REC_RHS && !rhs_en && !lhs_start;
+    end
+
+    always_ff @(posedge clock) begin
+        if(reset) input_state <= IDLE;
+        else input_state <= next_input_state;
+    end
+    
+    logic [`N-1:0] delay_ctr, delay_ctr_next;
+    logic delay_started, delay_en;
+    //logic [`N-1:0] end_sign = `delayPE - 1;
+    //logic [`N-1:0] end_sign = `delayPE;
+    logic [`N-1:0] end_sign = `delayPE + 5; //for debugging
+    
+    assign delay_en = lhs_start || delay_started;
+    assign delay_ctr_next = delay_en ? delay_ctr + 1 : delay_ctr;
+
+    always_ff @(posedge clock) begin
+        if(reset) delay_started <= 0;
+        else delay_started <= delay_ctr != end_sign && delay_ctr != 0 || lhs_start;
+    end
+
+    always_ff @(posedge clock) begin
+        if(reset) delay_ctr <= 0;
+        else delay_ctr <= delay_ctr_next;
+    end
+
+    always_comb begin
+        next_input_state = input_state;
+        case(input_state)
+            IDLE: next_input_state = rhs_start ? REC_RHS : input_state;
+            REC_RHS: next_input_state = rhs_en ? REC_RHS : REC_LHS;
+            REC_LHS: next_input_state = lhs_en ? REC_LHS : DONE;
+            //CALC: next_input_state = delay_ctr == end_sign ? DONE : CALC;
+            DONE: next_input_state = IDLE;
+        endcase 
+    end
+
+    localparam SEND_OUT = 5;
+    logic [2:0] output_state, next_output_state;
+    //assign out_ready = output_state == IDLE && input_state == DONE;
+    assign out_ready = output_state == IDLE && delay_ctr == end_sign;
+    always_ff @(posedge clock) begin
+        if(reset) output_state <= IDLE;
+        else output_state <= next_output_state;
+    end
+    always_comb begin
+        next_output_state = output_state;
+        case(output_state)
+            IDLE: next_output_state = out_start ? SEND_OUT : output_state;
+            SEND_OUT: next_output_state = out_en ? SEND_OUT : DONE;
+            DONE: next_output_state = IDLE;
+        endcase 
+    end
+
     // input/output buffer
     data_t rhs_buffer [`N-1:0][`N-1:0];
     data_t out_buffer [`N-1:0][`N-1:0];
-
-    localparam IDLE = 0, READING_RHS = 1, DONE_RHS = 2, OUTPUT_RESULT = 3, DONE_OUTPUT = 4, CALCULATING = 5;
-    logic [2:0] state, next_state;
-
-    logic rhs_input_valid;
-    //logic output_valid;
-    assign rhs_input_valid = state == READING_RHS || rhs_start;
-    //assign output_valid = state == OUTPUT_RESULT || out_start;
-
-    always_ff @(posedge clock or posedge rhs_start ) begin
-        if(reset)
-            state <= IDLE;
-        else if(rhs_start)
-            state <= READING_RHS;
-        else
-            state <= next_state;
-    end
     
-    always_comb begin
-        next_state = state;
-        case(state)
-            IDLE: begin
-                if(rhs_start) next_state = READING_RHS;
-            end
-            READING_RHS: begin
-                if(rhs_input_cnt == `N/4-1) next_state = DONE_RHS;
-            end
-            DONE_RHS: begin
-                next_state = OUTPUT_RESULT;
-            end
-            OUTPUT_RESULT: begin
-                if(output_cnt == `N/4-1) next_state = DONE_OUTPUT;
-            end
-            DONE_OUTPUT: next_state = IDLE;
-            default: next_state = state;
-        endcase
-    end
-
-    logic [`N/4-1:0] rhs_input_cnt;
-    //logic [`N/4-1:0] output_cnt;
-
-    //assign rhs_ready = rhs_input_cnt == `N/4 - 1 && rhs_input_valid;
-
-    // ready signal detector
-    // for starting input, calculating and output
-    logic rhs_ready_next;
-    //logic out_ready_next;
-    logic lhs_ready_ns_next;
-    always_ff @(posedge clock) begin
-        if(reset)
-            rhs_ready <= 0;
-        else
-            rhs_ready <= rhs_ready_next;
-    end
-    always_comb begin
-        rhs_ready_next = state == IDLE && ~rhs_ready;
-    end
-
-    always_ff @(posedge clock) begin
-        if(reset)
-            lhs_ready_ns <= 0;
-        else
-            lhs_ready_ns <= lhs_ready_ns_next;
-    end
-    always_comb begin
-        lhs_ready_ns_next = state == DONE_RHS;
-    end
-
-
-    always_ff @(posedge clock) begin
-        if(reset)
-            rhs_input_cnt <= 0;
-        else begin
-            case(state)
-                READING_RHS: rhs_input_cnt <= rhs_input_cnt + 1;
-                default: rhs_input_cnt <= rhs_input_cnt;
-            endcase
-        end
-    end
-
-    // output ctr
-    logic out_started, out_en;
-    logic [`N-1:0] out_ctr, out_ctr_next;  // lgN-2?
-    assign out_en = out_start || out_started;
-    assign out_ctr_next = out_en ? out_ctr + 1 : out_ctr;
-    always_ff @(posedge clock) begin
-        if(reset) out_started <= 0;
-        else out_started <= out_start || (out_ctr != (`N/4-1));
-    end
-
     // read the rhs_input
     always_ff @(posedge clock) begin
         for(int i = 0; i < 4; i++) begin
             for(int j = 0; j < `N; j++) begin
-                if(rhs_input_valid)
+                if(rhs_en)
                     //rhs_buffer[rhs_input_cnt * 4 + i][j] <= rhs_data[i][j];
-                    rhs_buffer[j][rhs_input_cnt * 4 + i] <= rhs_data[i][j]; // store RHS_T in the buffer
+                    rhs_buffer[i][rhs_ctr * 4 + j] <= rhs_data[i][j]; // store RHS_T in the buffer?
             end
         end
     end
-                
+    // output the result
+    always_ff @(posedge clock) begin
+        for(int i = 0; i < 4; i++) begin
+            for(int j = 0; j< `N; j++) begin
+                if(out_en)
+                    out_data[i][j] <= out_buffer[out_ctr * 4 + i][j];   //synchronization problem??
+            end
+        end
+    end
+    
+    `START_DETECTOR(out_col_detector, Vector, out_start, out_col_en, out_col_ctr)
+    always_ff @(posedge clock) begin
+        for(int i = 0;i < 4; i++) begin
+            if(out_col_en)
+                out_buffer[out_col_ctr][i] <= pe_out_cols[i][`N-1];
+        end
+    end
+
     // instantiate `N PEs
+    logic lhs_en;
+    logic pe_out_cols[`N-1:0][`N-1:0];
     generate
         for(genvar i = 0; i < `N; i++) begin
             PE PE_UNIT(
@@ -386,23 +422,14 @@ module SpMM(
                 .lhs_col(lhs_col),
                 .lhs_data(lhs_data),
                 .rhs(rhs_buffer[i]),
-                .out(out_buffer[i]),
+                .out(pe_out_cols[i]),
+                //.out(out_buffer[i]),
                 .delay(),
-                .num_el()
+                .num_el(),
+                .lhs_en(lhs_en)
             );
         end
     endgenerate
-
-    // output the result
-    always_ff @(posedge clock) begin
-        for(int i = 0; i < 4; i++) begin
-            for(int j = 0; j< `N; j++) begin
-                if(out_en)
-                    out_data[i][j] <= out_buffer[output_cnt * 4 + i][j];
-            end
-        end
-    end
-
 
     // debug print in a text file
     integer file = $fopen("output.txt", "w");
@@ -411,8 +438,6 @@ module SpMM(
     `PRINT_ARRAY(print_out_buffer, `N, `N, out_buffer)
 
     always @(posedge clock or negedge clock) begin
-        $fdisplay(file, "clk = %b, rhs_start = %b, rhs_ready = %b, rhs_cnt=%d, rhs_valid = %b, state = %s", clock, rhs_start, rhs_ready, rhs_input_cnt, rhs_input_valid, 
-        state == 0 ? "IDLE" : state == 1 ? "READING RHS" : state == 2 ? "RHS_DONE" : state == 3 ? "OUTPUT_RES" : "DONE_OUTPUT");
         $fdisplay(file, "rhs input: "); print_rhs();
         $fdisplay(file, "rhs_buffer: "); print_rhs_buffer();
         $fdisplay(file, "lhs_start = %b, lhs_ready_ns = %b", lhs_start, lhs_ready_ns);
