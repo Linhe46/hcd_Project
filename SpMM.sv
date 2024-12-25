@@ -414,8 +414,8 @@ module SpMM(
         for(int i = 0; i < 4; i++) begin
             for(int j = 0; j < `N; j++) begin
                 if(rhs_en)
-                    rhs_buffer[rhs_ctr * 4 + i][j] <= rhs_data[i][j];
-                    //rhs_buffer[i][rhs_ctr * 4 + j] <= rhs_data[i][j]; // store RHS_T in the buffer?
+                    //rhs_buffer[rhs_ctr * 4 + i][j] <= rhs_data[i][j];
+                    rhs_buffer[j][rhs_ctr * 4 + i] <= rhs_data[i][j]; // store RHS_T in the buffer?
             end
         end
     end
