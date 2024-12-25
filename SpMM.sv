@@ -4,13 +4,15 @@
 `define W               8
 `define lgN     ($clog2(`N))
 `define dbLgN (2*$clog2(`N))
-`define N2              `N*`N
+
 `define delayRedUnit   `lgN + 1
 `define delayPE        `lgN + 2
-
 `define Vector 0
 `define Buffer 1
 
+// prevent auto-inference for width
+/* verilator lint_off WIDTHEXPAND */
+/* verilator lint_off WIDTHTRUNC */
 
 typedef struct packed { logic [`W-1:0] data; } data_t;
 
@@ -97,7 +99,7 @@ module RedUnit(
     // num_el 总是赋值为 N
     assign num_el = `N;
     // delay 你需要自己为其赋值，表示电路的延迟
-    //assign delay = `lgN + 1; // delay is log_2(N) for an adder tree, 1 for read out
+    // delay is log_2(N) for an adder tree, 1 for read out
     assign delay = `delayRedUnit;
 
     // 60 points assumption: only read one single line (split === 0)
@@ -109,7 +111,6 @@ module RedUnit(
         .sum_out(partial_sum[`N-1]) // for 60p cases, the checker's output_idx
     );
 
-    //assign out_data[`N-1] = partial_sum;
     always_ff @(posedge clock) begin
         for(int i=0;i<`N;i++) begin
             out_data[i] <= partial_sum[out_idx[i]];
@@ -209,25 +210,17 @@ module PE(
     // num_el 总是赋值为 N
     assign num_el = `N;
     // delay 你需要自己为其赋值，表示电路的延迟
-    //assign delay = `N;
     //assign delay = `lgN + 2; // lgN+1 for RedUnit, 1 for inner product
     assign delay = `delayPE;
     
     logic [`lgN-1:0] lhs_ctr;
-    StartDetector #(.Type(`Vector)) lhs_detector(
-        .clock(clock),
-        .reset(reset),
-        .start(lhs_start),
-        .en(lhs_en),
-        .ctr_(lhs_ctr)
-    );
+    StartDetector #(.Type(`Vector)) lhs_detector(.clock(clock), .reset(reset), .start(lhs_start), .en(lhs_en), .ctr_(lhs_ctr));
 
     // convert the CSR format matrix into readable form 
     // split and output_idx definition
 
-    logic split [`N-1:0];
+    logic split [`N-1:0]; // to be implemented
     data_t data [`N-1:0];
-    data_t out_reg [`N-1:0];
     logic [`lgN-1:0] out_idx [`N-1:0];
     
     // 60 pt out_idx
@@ -244,23 +237,12 @@ module PE(
         end
     endgenerate
 
-    RedUnit PE_REDUNIT(
-        .clock(clock),
-        .reset(reset),
-        .data(data),
-        .split(split),
-        .out_idx(out_idx),
-        .out_data(out_reg)
-    );
-
-    always_comb begin
-        for(int i=0; i<`N;i++) begin
-            out[i] = out_reg[i];
-        end
-    end
+    // Reduce the data to output
+    RedUnit PE_REDUNIT(.clock(clock), .reset(reset), .data(data), .split(split), .out_idx(out_idx), .out_data(out));
 
 endmodule
 
+// print array task macro
 `define PRINT_ARRAY(TASK_NAME, ROW_MAX, COL_MAX, ARRAY_NAME) \
     task TASK_NAME; \
         integer i, j; \
@@ -319,7 +301,7 @@ module SpMM(
 
     // ready logic
     // lhs_ready_ns, rhs_ready and out_ready
-    localparam IDLE = 0, REC_RHS = 1, REC_LHS = 2, DONE = 3;
+    localparam IDLE = 0, REC_RHS = 1, REC_LHS = 2, DONE = 3, UPDATE_OUT = 4, SEND_OUT = 5;
     logic [2:0] input_state, next_input_state;
     //assign rhs_ready = input_state == IDLE;
     always_ff @(posedge clock) begin
@@ -368,7 +350,6 @@ module SpMM(
         endcase 
     end
 
-    localparam UPDATE_OUT = 5, SEND_OUT = 6;
     logic [2:0] output_state, next_output_state;
     //assign out_ready = output_state == IDLE && input_state == DONE;
     //assign out_ready = output_state == IDLE && delay_ctr == end_sign;
@@ -409,7 +390,7 @@ module SpMM(
     data_t rhs_buffer [`N-1:0][`N-1:0];
     data_t out_buffer [`N-1:0][`N-1:0];
     
-    // read the rhs_input
+    // RHS Read Logic
     always_ff @(posedge clock) begin
         for(int i = 0; i < 4; i++) begin
             for(int j = 0; j < `N; j++) begin
@@ -428,6 +409,8 @@ module SpMM(
             end
         end
     end*/
+
+    // OUT Send Logic
     always_comb begin
         for(int i = 0; i < 4; i++) begin
             for(int j = 0; j< `N; j++) begin
@@ -436,15 +419,7 @@ module SpMM(
         end
     end
     
-    // get the result
-    always_ff @(posedge clock) begin
-        for(int j = 0; j < `N; j++) begin
-                //out_buffer[out_col_ctr * 4][i] <= pe_out_cols[i][`N-1];
-                out_buffer[out_col_ctr][j] = out_col_en ? pe_out_cols[j][`N-1] : 0;
-        end 
-    end
-
-    // instantiate `N PEs
+    // Instantiate N PEs in parallel
     logic lhs_en;
     data_t pe_out_cols[`N-1:0][`N-1:0];
     generate
@@ -457,25 +432,34 @@ module SpMM(
                 .lhs_col(lhs_col),
                 .lhs_data(lhs_data),
                 .rhs(rhs_buffer[i]),
-                .out(pe_out_cols[i]),
-                //.out(out_buffer[i]),
+                .out(pe_out_cols[i]), // output column vectors
                 .delay(),
                 .num_el(),
-                .lhs_en(lhs_en)
+                .lhs_en(lhs_en) // ensure produce the total output matrix
             );
         end
     endgenerate
+    // Output the column vectors to the out_buffer
+    always_ff @(posedge clock) begin
+        for(int j = 0; j < `N; j++) begin
+                out_buffer[out_col_ctr][j] = out_col_en ? pe_out_cols[j][`N-1] : 0;
+        end 
+    end
+
 
     // debug print in a text file
     integer file = $fopen("output.txt", "w");
+    // register debugging functions
     `PRINT_ARRAY(print_rhs, 4, `N, rhs_data)
     `PRINT_ARRAY(print_rhs_buffer, `N, `N, rhs_buffer)
     `PRINT_ARRAY(print_out_buffer, `N, `N, out_buffer)
+    `PRINT_ARRAY(print_lhs, 1, `N, lhs_data)
 
     always @(posedge clock or negedge clock) begin
         $fdisplay(file, "rhs input: "); print_rhs();
         $fdisplay(file, "rhs_buffer: "); print_rhs_buffer();
         $fdisplay(file, "lhs_start = %b, lhs_ready_ns = %b", lhs_start, lhs_ready_ns);
+        $fdisplay(file, "lhs_data: "); print_lhs();
         $fdisplay(file, "out_buffer: "); print_out_buffer();
     end
 
