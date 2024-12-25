@@ -274,6 +274,9 @@ static void generate_gtkw_file(const char * out, int num_el) {
     fout << "TOP.rhs_start\n";
     fout << "TOP.out_ready\n";
     fout << "TOP.out_start\n";
+    for(int i = 0; i < 4; i++)
+        for(int j = 0; j < num_el; j++) 
+            fout << "[color] 2\nTOP.out_buffer[" << i << "][" << j << "][7:0]\n";
     fout.close();
 }
 

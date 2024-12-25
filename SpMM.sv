@@ -122,18 +122,20 @@ module StartDetector #(parameter Type = `Vector)(
     input logic reset,
     input logic start,
     output logic en,
-    output ctr
+    output logic [`lgN-1:0] ctr_
 );
     generate
         if(Type == `Buffer) begin
             if(`N == 4) begin
                 assign en = start;
+                assign ctr_ = 0;
             end
             else begin 
                 logic started;
                 logic [`lgN-3:0] ctr_next, ctr;
                 assign en = start || started;
                 assign ctr_next = en ? ctr + 1 : ctr;
+                assign ctr_ = ctr;
                 
                 always_ff @(posedge clock) begin
                     if(reset) ctr <= 0;
@@ -150,6 +152,7 @@ module StartDetector #(parameter Type = `Vector)(
             logic [`lgN-1:0] ctr_next, ctr;
             assign en = start || started;
             assign ctr_next = en ? ctr + 1 : ctr;
+            assign ctr_ = ctr;
             
             always_ff @(posedge clock) begin
                 if(reset) ctr <= 0;
@@ -164,6 +167,32 @@ module StartDetector #(parameter Type = `Vector)(
 
 endmodule
 
+`define START_DETECTOR(DETECTOR_NAME, TYPE, START, EN, CTR) \
+    logic EN; \
+    generate \
+        if(`N == 4) begin \
+            logic CTR; \
+            assign CTR = 0; \
+            StartDetector #(.Type(`TYPE)) DETECTOR_NAME( \
+                .clock(clock), \
+                .reset(reset), \
+                .start(START), \
+                .en(EN), \
+                .ctr_() \
+            ); \
+        end \
+        else begin \
+            logic [`lgN-3:0] CTR; \
+            StartDetector #(.Type(`TYPE)) DETECTOR_NAME( \
+                .clock(clock), \
+                .reset(reset), \
+                .start(START), \
+                .en(EN), \
+                .ctr_(CTR) \
+            ); \
+        end \
+    endgenerate
+
 module PE(
     input   logic               clock,
                                 reset,
@@ -175,7 +204,7 @@ module PE(
     output  data_t              out[`N-1:0],
     output  int                 delay,
     output  int                 num_el
-    ,output lhs_en // used for SpMM ctrl
+    ,output logic lhs_en // used for SpMM ctrl
 );
     // num_el 总是赋值为 N
     assign num_el = `N;
@@ -184,13 +213,13 @@ module PE(
     //assign delay = `lgN + 2; // lgN+1 for RedUnit, 1 for inner product
     assign delay = `delayPE;
     
-    //logic lhs_en;
+    logic [`lgN-1:0] lhs_ctr;
     StartDetector #(.Type(`Vector)) lhs_detector(
         .clock(clock),
         .reset(reset),
         .start(lhs_start),
         .en(lhs_en),
-        .ctr()
+        .ctr_(lhs_ctr)
     );
 
     // convert the CSR format matrix into readable form 
@@ -245,32 +274,6 @@ endmodule
         end \
     endtask
 
-`define START_DETECTOR(DETECTOR_NAME, TYPE, START, EN, CTR) \
-    logic EN; \
-    generate \
-        if(`N == 4) begin \
-            logic CTR; \
-            assign CTR = 0; \
-            StartDetector #(.Type(`TYPE)) DETECTOR_NAME( \
-                .clock(clock), \
-                .reset(reset), \
-                .start(START), \
-                .en(EN), \
-                .ctr() \
-            ); \
-        end \
-        else begin \
-            logic [`lgN-3:0] CTR; \
-            StartDetector #(.Type(`TYPE)) DETECTOR_NAME( \
-                .clock(clock), \
-                .reset(reset), \
-                .start(START), \
-                .en(EN), \
-                .ctr(CTR) \
-            ); \
-        end \
-    endgenerate
-
 module SpMM(
     input   logic               clock,
                                 reset,
@@ -306,9 +309,13 @@ module SpMM(
     //assign out_ready = 0;
 
     // detect the start signal
-    `START_DETECTOR(rhs_detector, Buffer, rhs_start, rhs_en, rhs_ctr)
+    //`START_DETECTOR(rhs_detector, Buffer, rhs_start, rhs_en, rhs_ctr)
     //`START_DETECTOR(out_detector, Buffer, out_start, out_en, out_ctr)
-    `START_DETECTOR(out_detector, Buffer, out_start, out_en, out_ctr)
+    //`START_DETECTOR(out_detector, Buffer, out_start, out_en, out_ctr)
+    logic rhs_en, out_en;
+    logic [`lgN-1:0] rhs_ctr, out_ctr;
+    StartDetector #(.Type(`Buffer)) rhs_buffer_detector (.clock(clock), .reset(reset), .start(rhs_start), .en(rhs_en), .ctr_(rhs_ctr));
+    StartDetector #(.Type(`Buffer)) out_buffer_detector (.clock(clock), .reset(reset), .start(out_start), .en(out_en), .ctr_(out_ctr));
 
     // ready logic
     // lhs_ready_ns, rhs_ready and out_ready
@@ -334,7 +341,7 @@ module SpMM(
     logic delay_started, delay_en;
     //logic [`N-1:0] end_sign = `delayPE - 1;
     //logic [`N-1:0] end_sign = `delayPE;
-    logic [`N-1:0] end_sign = `delayPE + 5; //for debugging
+    logic [`N-1:0] end_sign = `delayPE ; //for debugging
     
     assign delay_en = lhs_start || delay_started;
     assign delay_ctr_next = delay_en ? delay_ctr + 1 : delay_ctr;
@@ -354,18 +361,24 @@ module SpMM(
         case(input_state)
             IDLE: next_input_state = rhs_start ? REC_RHS : input_state;
             REC_RHS: next_input_state = rhs_en ? REC_RHS : REC_LHS;
-            REC_LHS: next_input_state = lhs_en ? REC_LHS : DONE;
+            REC_LHS: next_input_state = lhs_en ? REC_LHS : UPDATE_OUT;
+            UPDATE_OUT: next_input_state = out_col_en ? UPDATE_OUT : DONE;
             //CALC: next_input_state = delay_ctr == end_sign ? DONE : CALC;
             DONE: next_input_state = IDLE;
         endcase 
     end
 
-    localparam SEND_OUT = 5;
+    localparam UPDATE_OUT = 5, SEND_OUT = 6;
     logic [2:0] output_state, next_output_state;
     //assign out_ready = output_state == IDLE && input_state == DONE;
-    assign out_ready = output_state == IDLE && delay_ctr == end_sign;
+    //assign out_ready = output_state == IDLE && delay_ctr == end_sign;
+
     always_ff @(posedge clock) begin
-        if(reset) output_state <= IDLE;
+        if(reset) out_ready <= 0;
+        else out_ready <= out_col_ctr == `N-1;
+    end
+    always_ff @(posedge clock) begin
+        if(reset) output_state <= IDLE; 
         else output_state <= next_output_state;
     end
     always_comb begin
@@ -374,7 +387,22 @@ module SpMM(
             IDLE: next_output_state = out_start ? SEND_OUT : output_state;
             SEND_OUT: next_output_state = out_en ? SEND_OUT : DONE;
             DONE: next_output_state = IDLE;
-        endcase 
+        endcase
+    end
+
+    logic [`lgN-1:0] out_col_ctr, out_col_ctr_next;
+    logic out_col_en, out_col_start, out_col_started;
+
+    assign out_col_start = delay_ctr == end_sign;
+    assign out_col_ctr_next = out_col_en ? out_col_ctr + 1 : out_col_ctr;
+    assign out_col_en = out_col_start || out_col_started;
+    always_ff @(posedge clock) begin
+        if(reset) out_col_ctr <= 0;
+        else out_col_ctr <= out_col_ctr_next;
+    end
+    always_ff @(posedge clock) begin
+        if(reset) out_col_started <= 0;
+        else out_col_started <= out_col_start || (out_col_ctr != `N-1 && out_col_ctr != 0);
     end
 
     // input/output buffer
@@ -386,32 +414,39 @@ module SpMM(
         for(int i = 0; i < 4; i++) begin
             for(int j = 0; j < `N; j++) begin
                 if(rhs_en)
-                    //rhs_buffer[rhs_input_cnt * 4 + i][j] <= rhs_data[i][j];
-                    rhs_buffer[i][rhs_ctr * 4 + j] <= rhs_data[i][j]; // store RHS_T in the buffer?
+                    rhs_buffer[rhs_ctr * 4 + i][j] <= rhs_data[i][j];
+                    //rhs_buffer[i][rhs_ctr * 4 + j] <= rhs_data[i][j]; // store RHS_T in the buffer?
             end
         end
     end
     // output the result
-    always_ff @(posedge clock) begin
+    /*always_ff @(posedge clock) begin
         for(int i = 0; i < 4; i++) begin
             for(int j = 0; j< `N; j++) begin
                 if(out_en)
-                    out_data[i][j] <= out_buffer[out_ctr * 4 + i][j];   //synchronization problem??
+                    out_data[i][j] <= out_buffer[i][j];   //synchronization problem??
+            end
+        end
+    end*/
+    always_comb begin
+        for(int i = 0; i < 4; i++) begin
+            for(int j = 0; j< `N; j++) begin
+                out_data[i][j] = out_en ? out_buffer[i + out_ctr * 4][j] : 0;
             end
         end
     end
     
-    `START_DETECTOR(out_col_detector, Vector, out_start, out_col_en, out_col_ctr)
+    // get the result
     always_ff @(posedge clock) begin
-        for(int i = 0;i < 4; i++) begin
-            if(out_col_en)
-                out_buffer[out_col_ctr][i] <= pe_out_cols[i][`N-1];
-        end
+        for(int j = 0; j < `N; j++) begin
+                //out_buffer[out_col_ctr * 4][i] <= pe_out_cols[i][`N-1];
+                out_buffer[out_col_ctr][j] = out_col_en ? pe_out_cols[j][`N-1] : 0;
+        end 
     end
 
     // instantiate `N PEs
     logic lhs_en;
-    logic pe_out_cols[`N-1:0][`N-1:0];
+    data_t pe_out_cols[`N-1:0][`N-1:0];
     generate
         for(genvar i = 0; i < `N; i++) begin
             PE PE_UNIT(
