@@ -118,6 +118,20 @@ module RedUnit(
     end
 endmodule
 
+/*
+module RedUnit_PfxSum(
+    input logic clock,
+    input logic reset,
+    input data_t data[`N-1:0],
+    input logic split[`N-1:0],
+    input logic [`lgN-1:0] out_idx[`N-1:0],
+    output data_t out_data[`N-1:0],
+    output int delay,
+    output int num_el
+);
+endmodule
+*/
+
 module StartDetector #(parameter Type = `Vector)(
     input logic clock,
     input logic reset,
@@ -168,32 +182,6 @@ module StartDetector #(parameter Type = `Vector)(
 
 endmodule
 
-`define START_DETECTOR(DETECTOR_NAME, TYPE, START, EN, CTR) \
-    logic EN; \
-    generate \
-        if(`N == 4) begin \
-            logic CTR; \
-            assign CTR = 0; \
-            StartDetector #(.Type(`TYPE)) DETECTOR_NAME( \
-                .clock(clock), \
-                .reset(reset), \
-                .start(START), \
-                .en(EN), \
-                .ctr_() \
-            ); \
-        end \
-        else begin \
-            logic [`lgN-3:0] CTR; \
-            StartDetector #(.Type(`TYPE)) DETECTOR_NAME( \
-                .clock(clock), \
-                .reset(reset), \
-                .start(START), \
-                .en(EN), \
-                .ctr_(CTR) \
-            ); \
-        end \
-    endgenerate
-
 module PE(
     input   logic               clock,
                                 reset,
@@ -219,18 +207,71 @@ module PE(
     // convert the CSR format matrix into readable form 
     // split and output_idx definition
 
-    logic split [`N-1:0]; // to be implemented
-    data_t data [`N-1:0];
-    logic [`lgN-1:0] out_idx [`N-1:0];
-    
-    // 60 pt out_idx
+    logic split [`N-1:0]; 
+    logic split_table [`N-1:0][`N-1:0];
+    logic [`lgN-1:0] row_id [`N-1:0];
+    logic [`lgN-1:0] col_id [`N-1:0];
+    always_comb begin
+        for(int i = 0; i < `N; i++) begin   
+            row_id[i] = lhs_ptr[i] / `N;
+            col_id[i] = lhs_ptr[i] % `N;
+        end
+    end
     always_comb begin
         for(int i = 0; i < `N; i++) begin
-            out_idx[i] = `N-1;
+            for(int j = 0; j < `N; j++) begin
+                split_table[i][j] = 0;
+            end
+        end
+        for(int i = 0; i < `N; i++)
+            split_table[row_id[i]][col_id[i]] = 1;
+    end
+    always_ff @(posedge clock) begin
+        for(int i = 0; i < `N; i++) begin
+            if(reset) split[i] <= 0;
+            else split[i] <= split_table[lhs_ctr][i];
+        end
+    end
+
+    // out_idx according to split vector
+    logic [`lgN-1:0] split_ctr, split_row_id, done_row_ctr;
+    logic split_row_en;
+    always_comb begin
+        split_ctr = 0;
+        for(int i = 0; i < `N; i++)
+            split_ctr += split[i]; // a split means a row is done
+    end
+    // if the final elment is not splited, the row is splited
+    assign split_row_en = ~split[`N-1];
+    /*always_ff @(posedge clock) begin
+        if(reset) split_row_en <= 0;
+        else split_row_en <= ~split[`N-1];
+    end*/
+    // count the done rows for the next row id
+    always_ff @(posedge clock) begin
+        if(reset) done_row_ctr <= 0;
+        else done_row_ctr <= done_row_ctr + split_ctr;
+    end 
+    
+    logic [`lgN-1:0] out_idx [`N-1:0];
+    logic [`lgN-1:0] out_idx_ctr;
+    logic out_idx_valid [`N-1:0];
+    logic [`lgN-1:0] new_row_ctr; 
+    always_comb begin
+        new_row_ctr = 0;
+        for(int i = 0; i < `N; i++)
+            out_idx_valid[i] = 0;
+        for(int i = 0; i < `N; i++) begin
+            if(split[i]) begin
+                out_idx[done_row_ctr + new_row_ctr] = i;
+                new_row_ctr = new_row_ctr + 1;
+                out_idx_valid[done_row_ctr + new_row_ctr] = 1;
+            end
         end
     end
     
     // Inner product of lhs_data and rhs_data
+    data_t data [`N-1:0];
     generate
         for(genvar i = 0; i < `N; i++)begin
             mul_ DATA_MUL_UNIT(.clock(clock), .a(lhs_data[i]), .b(rhs[lhs_col[i]]), .out(data[i]));
@@ -238,7 +279,21 @@ module PE(
     endgenerate
 
     // Reduce the data to output
-    RedUnit PE_REDUNIT(.clock(clock), .reset(reset), .data(data), .split(split), .out_idx(out_idx), .out_data(out));
+    data_t out_reg [`N-1:0];
+    RedUnit PE_REDUNIT(.clock(clock), .reset(reset), .data(data), .split(split), .out_idx(out_idx), .out_data(out_reg));
+
+    data_t saved_partial_sum;
+    always_ff @(posedge clock) begin
+        if(reset) saved_partial_sum <= 0;
+        else if(split_row_en) saved_partial_sum <= out_reg[out_idx[done_row_ctr + new_row_ctr]];
+        else saved_partial_sum <= saved_partial_sum;
+    end
+   
+    always_comb begin
+        for(int i = 0; i < `N - 1; i++) 
+            out[i] = out_reg[i];
+        out[`N-1] = out_reg[`N-1] + saved_partial_sum;
+    end
 
 endmodule
 
