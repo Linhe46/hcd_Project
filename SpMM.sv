@@ -38,6 +38,27 @@ module mul_(
     end
 endmodule
 
+// shift register for delay
+module delay_shift #(parameter W = `N, parameter DELAY_CYCLES = 1)(
+    input logic clock, reset,
+    input logic[W-1:0] in,
+    output logic[W-1:0] out
+);
+    logic [W-1:0] shift_reg [DELAY_CYCLES-1:0];
+    always_ff @(posedge clock) begin
+        for(int i = 1; i < `N; i++) begin
+            if(reset) shift_reg[i] <= 0;
+            else shift_reg[i] <= shift_reg[i-1];
+        end
+    end
+    always_ff @(posedge clock) begin
+        if(reset) shift_reg[0] <= 0;
+        else shift_reg[0] <= in;
+    end
+
+    assign out = shift_reg[DELAY_CYCLES-1];
+endmodule
+
 // a naive adder tree
 module AdderTree #(parameter LENGTH = `N)(
     input clock,
@@ -111,9 +132,19 @@ module RedUnit(
         .sum_out(partial_sum[`N-1]) // for 60p cases, the checker's output_idx
     );
 
+    // need to delay the out_idx for lgN + 1 cycles
+    logic [`lgN-1:0] out_idx_reg [`N-1:0];
+    generate
+        for(genvar i = 0; i < `N; i++) begin
+            delay_shift #(.W(`lgN), .DELAY_CYCLES(`delayRedUnit)) delay_shift_unit(.clock(clock), .reset(reset), .in(out_idx[i]), .out(out_idx_reg[i]));
+        end
+    endgenerate
+
+
     always_ff @(posedge clock) begin
         for(int i=0;i<`N;i++) begin
-            out_data[i] <= partial_sum[out_idx[i]];
+            //out_data[i] <= partial_sum[out_idx[i]];
+            out_data[i] <= partial_sum[out_idx_reg[i]];
         end
     end
 endmodule
@@ -194,6 +225,7 @@ module PE(
     output  int                 delay,
     output  int                 num_el
     ,output logic lhs_en // used for SpMM ctrl
+    ,output logic out_idx_valid [`N-1:0] // used for SpMM output
 );
     // num_el 总是赋值为 N
     assign num_el = `N;
@@ -226,11 +258,15 @@ module PE(
         for(int i = 0; i < `N; i++)
             split_table[row_id[i]][col_id[i]] = 1;
     end
-    always_ff @(posedge clock) begin
+    /*always_ff @(posedge clock) begin
         for(int i = 0; i < `N; i++) begin
             if(reset) split[i] <= 0;
             else split[i] <= split_table[lhs_ctr][i];
         end
+    end*/
+    always_comb begin
+        for(int i = 0; i < `N; i++)
+            split[i] = lhs_en ? split_table[lhs_ctr][i] : 0;
     end
 
     // out_idx according to split vector
@@ -249,27 +285,29 @@ module PE(
     end*/
     // count the done rows for the next row id
     always_ff @(posedge clock) begin
-        if(reset) done_row_ctr <= 0;
+        if(reset || !lhs_en) done_row_ctr <= 0;
         else done_row_ctr <= done_row_ctr + split_ctr;
     end 
-    
+
+    // out_idx generation logic
     logic [`lgN-1:0] out_idx [`N-1:0];
+    //logic out_idx_valid [`N-1:0]; stated as output port
     logic [`lgN-1:0] out_idx_ctr;
-    logic out_idx_valid [`N-1:0];
-    logic [`lgN-1:0] new_row_ctr; 
     always_comb begin
-        new_row_ctr = 0;
-        for(int i = 0; i < `N; i++)
+        out_idx_ctr = 0;
+        for(int i = 0; i < `N; i++) begin
+            out_idx[i] = 0;
             out_idx_valid[i] = 0;
+        end
         for(int i = 0; i < `N; i++) begin
             if(split[i]) begin
-                out_idx[done_row_ctr + new_row_ctr] = i;
-                new_row_ctr = new_row_ctr + 1;
-                out_idx_valid[done_row_ctr + new_row_ctr] = 1;
+                out_idx[done_row_ctr + out_idx_ctr] = i;
+                out_idx_valid[done_row_ctr + out_idx_ctr] = 1;
+                out_idx_ctr += 1;
             end
         end
     end
-    
+
     // Inner product of lhs_data and rhs_data
     data_t data [`N-1:0];
     generate
@@ -282,17 +320,17 @@ module PE(
     data_t out_reg [`N-1:0];
     RedUnit PE_REDUNIT(.clock(clock), .reset(reset), .data(data), .split(split), .out_idx(out_idx), .out_data(out_reg));
 
-    data_t saved_partial_sum;
+    /*data_t saved_partial_sum;
     always_ff @(posedge clock) begin
         if(reset) saved_partial_sum <= 0;
         else if(split_row_en) saved_partial_sum <= out_reg[out_idx[done_row_ctr + new_row_ctr]];
         else saved_partial_sum <= saved_partial_sum;
-    end
+    end*/
    
     always_comb begin
-        for(int i = 0; i < `N - 1; i++) 
+        for(int i = 0; i < `N; i++) 
             out[i] = out_reg[i];
-        out[`N-1] = out_reg[`N-1] + saved_partial_sum;
+        //out[`N-1] = out_reg[`N-1] + saved_partial_sum;
     end
 
 endmodule
@@ -378,7 +416,7 @@ module SpMM(
     logic delay_started, delay_en;
     //logic [`N-1:0] end_sign = `delayPE - 1;
     //logic [`N-1:0] end_sign = `delayPE;
-    logic [`N-1:0] end_sign = `delayPE ; //for debugging
+    logic [`N-1:0] end_sign = `delayPE ; //for debugging    
     
     assign delay_en = lhs_start || delay_started;
     assign delay_ctr_next = delay_en ? delay_ctr + 1 : delay_ctr;
@@ -430,7 +468,7 @@ module SpMM(
     logic out_col_en, out_col_start, out_col_started;
 
     assign out_col_start = delay_ctr == end_sign;
-    assign out_col_ctr_next = out_col_en ? out_col_ctr + 1 : out_col_ctr;
+    assign out_col_ctr_next = out_col_en ? out_col_ctr + 1 : out_col_ctr; // if there is redundant?
     assign out_col_en = out_col_start || out_col_started;
     always_ff @(posedge clock) begin
         if(reset) out_col_ctr <= 0;
@@ -476,8 +514,16 @@ module SpMM(
     
     // Instantiate N PEs in parallel
     logic lhs_en;
-    data_t pe_out_cols[`N-1:0][`N-1:0];
+    data_t pe_out_cols [`N-1:0][`N-1:0];
+    logic pe_out_cols_valid [`N-1:0];
+    logic pe_out_cols_valid_delayed [`N-1:0]; // delay the PE valid flags for output
+    
     generate
+        for(genvar i = 0; i < `N; i++) begin
+            delay_shift #(.W(1), .DELAY_CYCLES(`delayPE)) pe_out_cols_valid_delay_shift(
+            .clock(clock), .reset(reset), .in(pe_out_cols_valid[i]), .out(pe_out_cols_valid_delayed[i])
+        );
+        end
         for(genvar i = 0; i < `N; i++) begin
             PE PE_UNIT(
                 .clock(clock),
@@ -490,16 +536,31 @@ module SpMM(
                 .out(pe_out_cols[i]), // output column vectors
                 .delay(),
                 .num_el(),
-                .lhs_en(lhs_en) // ensure produce the total output matrix
+                .lhs_en(lhs_en), // ensure produce the total output matrix
+                .out_idx_valid(pe_out_cols_valid) // only output the valid value to buffer
             );
         end
     endgenerate
-    // Output the column vectors to the out_buffer
+    // Offload the column vectors to the out_buffer
+    /*
     always_ff @(posedge clock) begin
         for(int j = 0; j < `N; j++) begin
-                out_buffer[out_col_ctr][j] = out_col_en ? pe_out_cols[j][`N-1] : 0;
+                out_buffer[out_col_ctr][j] = out_col_en ? pe_out_cols[j][`N-1] : 0; // for 60 pts, no split and out_idx
         end 
+    end*/
+    always_ff @(posedge clock) begin
+        for(int j = 0; j < `N; j++) begin
+            for(int i = 0; i < `N; i++) begin
+                if(pe_out_cols_valid_delayed[i]) begin
+                    out_buffer[i][j] <= pe_out_cols[j][i];
+                end
+                else begin
+                    out_buffer[i][j] <= out_buffer[i][j];
+                end
+            end
+        end
     end
+
 
 
     // debug print in a text file
