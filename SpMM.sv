@@ -146,8 +146,8 @@ module RedUnit(
 
     always_ff @(posedge clock) begin
         for(int i=0;i<`N;i++) begin
-            //out_data[i] <= partial_sum[out_idx[i]];
-            out_data[i] <= partial_sum[out_idx_reg[i]];
+            out_data[i] <= partial_sum[out_idx[i]];
+            //out_data[i] <= partial_sum[out_idx_reg[i]];
         end
     end
 endmodule
@@ -224,13 +224,23 @@ module RedUnit_PfxSum(
     // get partsum
     always_ff @(posedge clock) begin
         for(int i = 0; i < `N; i++) begin
-            part_sum[i] <= partsum_head_idx[i] > 0 ? pfx_sum[`lgN][i] - pfx_sum[`lgN][partsum_head_idx[i] - 1] : pfx_sum[`lgN][i]; 
+            if(reset) part_sum[i] <= 0;
+            else part_sum[i] <= partsum_head_idx[i] > 0 ? pfx_sum[`lgN][i] - pfx_sum[`lgN][partsum_head_idx[i] - 1] : pfx_sum[`lgN][i]; 
         end
+    end
+    
+    // Halo Adder for splited rows
+    data_t halo_part_sum;
+    always_ff @(posedge clock) begin
+        if(reset) halo_part_sum <= 0;
+        else halo_part_sum <= split_reg[`N-1] ? 0 : part_sum[`N-1]; // if not splited, save the part sum
+        //else halo_part_sum <= split_reg[`N-1] ? part_sum[`N-1] : 0; // for debugging in 60 pts
     end
 
     // load to output_data
     generate
-        for(genvar i = 0; i < `N; i++)
+        assign out_data[0] = part_sum[out_idx_reg[0]] + halo_part_sum;
+        for(genvar i = 1; i < `N; i++)
             assign out_data[i] = part_sum[out_idx_reg[i]];
     endgenerate
 
@@ -394,17 +404,9 @@ module PE(
     //RedUnit PE_REDUNIT(.clock(clock), .reset(reset), .data(data), .split(split), .out_idx(out_idx), .out_data(out_reg));
     RedUnit_PfxSum PE_REDUNIT_PFXSUM(.clock(clock), .reset(reset), .data(data), .split(split), .out_idx(out_idx), .out_data(out_reg));
 
-    /*data_t saved_partial_sum;
-    always_ff @(posedge clock) begin
-        if(reset) saved_partial_sum <= 0;
-        else if(split_row_en) saved_partial_sum <= out_reg[out_idx[done_row_ctr + new_row_ctr]];
-        else saved_partial_sum <= saved_partial_sum;
-    end*/
-   
     always_comb begin
         for(int i = 0; i < `N; i++) 
             out[i] = out_reg[i];
-        //out[`N-1] = out_reg[`N-1] + saved_partial_sum;
     end
 
 endmodule
