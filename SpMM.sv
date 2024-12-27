@@ -4,9 +4,12 @@
 `define W               8
 `define lgN     ($clog2(`N))
 `define dbLgN (2*$clog2(`N))
+`define lglgN   ($clog2(`lgN))
 
 `define delayRedUnit   `lgN + 1
-`define delayPE        `lgN + 2
+`define delayRedUnit_PfxSum `lgN + 1
+//`define delayPE       `delayRedUnit + 1
+`define delayPE        `delayRedUnit_PfxSum + 1
 `define Vector 0
 `define Buffer 1
 
@@ -149,19 +152,89 @@ module RedUnit(
     end
 endmodule
 
-/*
 module RedUnit_PfxSum(
-    input logic clock,
-    input logic reset,
-    input data_t data[`N-1:0],
-    input logic split[`N-1:0],
-    input logic [`lgN-1:0] out_idx[`N-1:0],
-    output data_t out_data[`N-1:0],
-    output int delay,
-    output int num_el
+    input   logic               clock,
+                                reset,
+    input   data_t              data[`N-1:0],
+    input   logic               split[`N-1:0],
+    input   logic [`lgN-1:0]    out_idx[`N-1:0],
+    output  data_t              out_data[`N-1:0],
+    output  int                 delay,
+    output  int                 num_el
 );
+    // num_el 总是赋值为 N
+    assign num_el = `N;
+    // delay 你需要自己为其赋值，表示电路的延迟
+    assign delay = `delayRedUnit_PfxSum;
+
+    // Prefix sum logic: Hillis-Steele Scan Algorithm
+    data_t pfx_sum [`lgN:0][`N-1:0];  // depth is lgN+1, width is N
+    //logic flag;
+    data_t zero;
+    assign zero.data = 0;
+
+    generate
+        // leaf nodes
+        for(genvar i = 0; i < `N; i++)
+            assign pfx_sum[0][i] = data[i];
+
+        for(genvar i = 0; i < `lgN; i++) begin
+            for(genvar j = 0; j < `N; j++) begin
+                localparam two_power_i = 1 << i;
+                localparam flag = j < two_power_i;
+                add_ pfx_sum_adder(
+                    .clock(clock),
+                    .a(pfx_sum[i][j]), 
+                    .b(flag ? zero : pfx_sum[i][j - two_power_i]),
+                    .out(pfx_sum[i + 1][j]));
+            end
+        end
+    endgenerate
+
+    // delay the out_idx and split 
+    // to get the correct part sum and output data
+    logic [`lgN-1:0] out_idx_reg [`N-1:0];
+    logic split_reg [`N-1:0];
+    generate
+        for(genvar i = 0; i < `N; i++) begin
+            // lgN for pfxsum, 1 for part sum update
+            delay_shift #(.W(1), .DELAY_CYCLES(`lgN + 1)) split_delay_shift(.clock(clock), .reset(reset), .in(split[i]), .out(split_reg[i]));
+            // additional 1 cycle for output 
+            delay_shift #(.W(`lgN), .DELAY_CYCLES(`lgN + 2)) out_idx_delay_shift(.clock(clock), .reset(reset), .in(out_idx[i]), .out(out_idx_reg[i])); 
+        end
+    endgenerate
+
+    // get partsum start idx
+    data_t part_sum [`N-1:0];
+    logic [`lgN-1:0] partsum_head_idx [`N-1:0];
+    logic found;
+    always_comb begin
+        for(int i = 0; i < `N; i++) begin
+            partsum_head_idx[i] = 0;
+            found = 0;
+            for(int j = i - 1; j > 0; j--) begin
+                if(split_reg[j]) begin
+                    partsum_head_idx[i] = j;
+                    found = 1;
+                end
+            end
+        end
+    end
+
+    // get partsum
+    always_ff @(posedge clock) begin
+        for(int i = 0; i < `N; i++) begin
+            part_sum[i] <= partsum_head_idx[i] > 0 ? pfx_sum[`lgN][i] - pfx_sum[`lgN][partsum_head_idx[i] - 1] : pfx_sum[`lgN][i]; 
+        end
+    end
+
+    // load to output_data
+    generate
+        for(genvar i = 0; i < `N; i++)
+            assign out_data[i] = part_sum[out_idx_reg[i]];
+    endgenerate
+
 endmodule
-*/
 
 module StartDetector #(parameter Type = `Vector)(
     input logic clock,
@@ -318,7 +391,8 @@ module PE(
 
     // Reduce the data to output
     data_t out_reg [`N-1:0];
-    RedUnit PE_REDUNIT(.clock(clock), .reset(reset), .data(data), .split(split), .out_idx(out_idx), .out_data(out_reg));
+    //RedUnit PE_REDUNIT(.clock(clock), .reset(reset), .data(data), .split(split), .out_idx(out_idx), .out_data(out_reg));
+    RedUnit_PfxSum PE_REDUNIT_PFXSUM(.clock(clock), .reset(reset), .data(data), .split(split), .out_idx(out_idx), .out_data(out_reg));
 
     /*data_t saved_partial_sum;
     always_ff @(posedge clock) begin
@@ -560,8 +634,6 @@ module SpMM(
             end
         end
     end
-
-
 
     // debug print in a text file
     integer file = $fopen("output.txt", "w");
