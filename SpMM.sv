@@ -6,10 +6,8 @@
 `define dbLgN (2*$clog2(`N))
 `define lglgN   ($clog2(`lgN))
 
-`define delayRedUnit   `lgN + 1
-`define delayRedUnit_PfxSum `lgN + 1
-//`define delayPE       `delayRedUnit + 1
-`define delayPE        `delayRedUnit_PfxSum + 1
+`define delayRedUnit    `lgN + 2
+`define delayPE        `delayRedUnit + 1
 `define Vector 0
 `define Buffer 1
 
@@ -123,49 +121,7 @@ module RedUnit(
     // num_el 总是赋值为 N
     assign num_el = `N;
     // delay 你需要自己为其赋值，表示电路的延迟
-    // delay is log_2(N) for an adder tree, 1 for read out
     assign delay = `delayRedUnit;
-
-    // 60 points assumption: only read one single line (split === 0)
-    // implement an adder tree
-    data_t partial_sum [`N-1:0];
-    AdderTree #(.LENGTH(`N)) add_tree(
-        .clock(clock),
-        .add_ins(data),
-        .sum_out(partial_sum[`N-1]) // for 60p cases, the checker's output_idx
-    );
-
-    // need to delay the out_idx for lgN + 1 cycles
-    logic [`lgN-1:0] out_idx_reg [`N-1:0];
-    generate
-        for(genvar i = 0; i < `N; i++) begin
-            delay_shift #(.W(`lgN), .DELAY_CYCLES(`delayRedUnit)) delay_shift_unit(.clock(clock), .reset(reset), .in(out_idx[i]), .out(out_idx_reg[i]));
-        end
-    endgenerate
-
-
-    always_ff @(posedge clock) begin
-        for(int i=0;i<`N;i++) begin
-            out_data[i] <= partial_sum[out_idx[i]];
-            //out_data[i] <= partial_sum[out_idx_reg[i]];
-        end
-    end
-endmodule
-
-module RedUnit_PfxSum(
-    input   logic               clock,
-                                reset,
-    input   data_t              data[`N-1:0],
-    input   logic               split[`N-1:0],
-    input   logic [`lgN-1:0]    out_idx[`N-1:0],
-    output  data_t              out_data[`N-1:0],
-    output  int                 delay,
-    output  int                 num_el
-);
-    // num_el 总是赋值为 N
-    assign num_el = `N;
-    // delay 你需要自己为其赋值，表示电路的延迟
-    assign delay = `delayRedUnit_PfxSum;
 
     // Prefix sum logic: Hillis-Steele Scan Algorithm
     data_t pfx_sum [`lgN:0][`N-1:0];  // depth is lgN+1, width is N
@@ -191,58 +147,53 @@ module RedUnit_PfxSum(
         end
     endgenerate
 
-    // delay the out_idx and split 
-    // to get the correct part sum and output data
+    // delay the split and out_idx for output
     logic [`lgN-1:0] out_idx_reg [`N-1:0];
     logic split_reg [`N-1:0];
     generate
         for(genvar i = 0; i < `N; i++) begin
-            // lgN for pfxsum, 1 for part sum update
-            delay_shift #(.W(1), .DELAY_CYCLES(`lgN + 1)) split_delay_shift(.clock(clock), .reset(reset), .in(split[i]), .out(split_reg[i]));
-            // additional 1 cycle for output 
-            delay_shift #(.W(`lgN), .DELAY_CYCLES(`lgN + 2)) out_idx_delay_shift(.clock(clock), .reset(reset), .in(out_idx[i]), .out(out_idx_reg[i])); 
+            // lgN for pfxsum
+            delay_shift #(.W(1), .DELAY_CYCLES(`lgN)) split_delay_shift(.clock(clock), .reset(reset), .in(split[i]), .out(split_reg[i]));
+            // 1 cycle for part_sum update 
+            delay_shift #(.W(`lgN), .DELAY_CYCLES(`lgN + 1)) out_idx_delay_shift(.clock(clock), .reset(reset), .in(out_idx[i]), .out(out_idx_reg[i])); 
+            // total delay is lgN + 2
         end
     endgenerate
 
     // get partsum start idx
     data_t part_sum [`N-1:0];
     logic [`lgN-1:0] partsum_head_idx [`N-1:0];
-    logic found;
+    logic found[`N-1:0];
     always_comb begin
         for(int i = 0; i < `N; i++) begin
             partsum_head_idx[i] = 0;
-            found = 0;
-            for(int j = i - 1; j > 0; j--) begin
-                if(split_reg[j]) begin
-                    partsum_head_idx[i] = j;
-                    found = 1;
+            found[i] = 0;
+            for(int j = i - 1; j >= 0; j--) begin
+                if(split_reg[j] && ~found[i]) begin
+                    partsum_head_idx[i] = j + 1; // [j+1, i] is the partsum range
+                    found[i] = 1;
                 end
+                else partsum_head_idx[i] = partsum_head_idx[i]; // only select the last split
             end
         end
     end
 
     // get partsum
     always_ff @(posedge clock) begin
-        for(int i = 0; i < `N; i++) begin
+        for(int i = 0; i < `N; i++)
             if(reset) part_sum[i] <= 0;
-            else part_sum[i] <= partsum_head_idx[i] > 0 ? pfx_sum[`lgN][i] - pfx_sum[`lgN][partsum_head_idx[i] - 1] : pfx_sum[`lgN][i]; 
-        end
+            else if(split_reg[i])
+                part_sum[i] <= partsum_head_idx[i] > 0 ? pfx_sum[`lgN][i] - pfx_sum[`lgN][partsum_head_idx[i] - 1] : pfx_sum[`lgN][i]; 
+            else part_sum[i] <= 0;
     end
     
-    // Halo Adder for splited rows
-    data_t halo_part_sum;
     always_ff @(posedge clock) begin
-        if(reset) halo_part_sum <= 0;
-        else halo_part_sum <= split_reg[`N-1] ? 0 : part_sum[`N-1]; // if not splited, save the part sum
-        //else halo_part_sum <= split_reg[`N-1] ? part_sum[`N-1] : 0; // for debugging in 60 pts
+        for(int i = 0; i < `N; i++) begin
+            if(reset)
+                out_data[i] <= 0;
+            else out_data[i] <= part_sum[out_idx_reg[i]];
+        end
     end
-
-    // load to output_data
-    generate
-        assign out_data[0] = part_sum[out_idx_reg[0]] + halo_part_sum;
-        for(genvar i = 1; i < `N; i++)
-            assign out_data[i] = part_sum[out_idx_reg[i]];
-    endgenerate
 
 endmodule
 
@@ -399,15 +350,7 @@ module PE(
         end
     endgenerate
 
-    // Reduce the data to output
-    data_t out_reg [`N-1:0];
-    //RedUnit PE_REDUNIT(.clock(clock), .reset(reset), .data(data), .split(split), .out_idx(out_idx), .out_data(out_reg));
-    RedUnit_PfxSum PE_REDUNIT_PFXSUM(.clock(clock), .reset(reset), .data(data), .split(split), .out_idx(out_idx), .out_data(out_reg));
-
-    always_comb begin
-        for(int i = 0; i < `N; i++) 
-            out[i] = out_reg[i];
-    end
+    RedUnit PE_REDUNIT(.clock(clock), .reset(reset), .data(data), .split(split), .out_idx(out_idx), .out_data(out));
 
 endmodule
 
