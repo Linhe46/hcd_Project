@@ -47,7 +47,7 @@ module delay_shift #(parameter W = `N, parameter DELAY_CYCLES = 1)(
 );
     logic [W-1:0] shift_reg [DELAY_CYCLES-1:0];
     always_ff @(posedge clock) begin
-        for(int i = 1; i < `N; i++) begin
+        for(int i = 1; i < DELAY_CYCLES; i++) begin
             if(reset) shift_reg[i] <= 0;
             else shift_reg[i] <= shift_reg[i-1];
         end
@@ -108,7 +108,7 @@ module AdderTree #(parameter LENGTH = `N)(
 
 endmodule
 
-module RedUnit(
+module RedUnit #(parameter UPPER_DELAY = 0)(
     input   logic               clock,
                                 reset,
     input   data_t              data[`N-1:0],
@@ -153,9 +153,10 @@ module RedUnit(
     generate
         for(genvar i = 0; i < `N; i++) begin
             // lgN for pfxsum
-            delay_shift #(.W(1), .DELAY_CYCLES(`lgN)) split_delay_shift(.clock(clock), .reset(reset), .in(split[i]), .out(split_reg[i]));
+            delay_shift #(.W(1), .DELAY_CYCLES(`lgN + UPPER_DELAY)) split_delay_shift(.clock(clock), .reset(reset), .in(split[i]), .out(split_reg[i]));
             // 1 cycle for part_sum update 
-            delay_shift #(.W(`lgN), .DELAY_CYCLES(`lgN + 1)) out_idx_delay_shift(.clock(clock), .reset(reset), .in(out_idx[i]), .out(out_idx_reg[i])); 
+            delay_shift #(.W(`lgN), .DELAY_CYCLES(`lgN + 1 + UPPER_DELAY)) out_idx_delay_shift(.clock(clock), .reset(reset), .in(out_idx[i]), .out(out_idx_reg[i])); 
+            // 1 cycle for output update
             // total delay is lgN + 2
         end
     endgenerate
@@ -267,14 +268,13 @@ module PE(
     //assign delay = `lgN + 2; // lgN+1 for RedUnit, 1 for inner product
     assign delay = `delayPE;
     
+    // get the enable signal and counter
     logic [`lgN-1:0] lhs_ctr;
     StartDetector #(.Type(`Vector)) lhs_detector(.clock(clock), .reset(reset), .start(lhs_start), .en(lhs_en), .ctr_(lhs_ctr));
 
-    // convert the CSR format matrix into readable form 
-    // split and output_idx definition
-
+    // get the split vector
     logic split [`N-1:0]; 
-    logic split_table [`N-1:0][`N-1:0];
+    logic split_table [`N-1:0][`N-1:0]; // a split lookup table
     logic [`lgN-1:0] row_id [`N-1:0];
     logic [`lgN-1:0] col_id [`N-1:0];
     always_comb begin
@@ -292,12 +292,7 @@ module PE(
         for(int i = 0; i < `N; i++)
             split_table[row_id[i]][col_id[i]] = 1;
     end
-    /*always_ff @(posedge clock) begin
-        for(int i = 0; i < `N; i++) begin
-            if(reset) split[i] <= 0;
-            else split[i] <= split_table[lhs_ctr][i];
-        end
-    end*/
+    // update split according to lhs_ctr
     always_comb begin
         for(int i = 0; i < `N; i++)
             split[i] = lhs_en ? split_table[lhs_ctr][i] : 0;
@@ -350,7 +345,18 @@ module PE(
         end
     endgenerate
 
-    RedUnit PE_REDUNIT(.clock(clock), .reset(reset), .data(data), .split(split), .out_idx(out_idx), .out_data(out));
+    data_t red_out [`N-1:0];
+    // instantiate RedUnit (1 additional delay from data's multiplication)
+    RedUnit #(.UPPER_DELAY(1)) PE_REDUNIT(.clock(clock), .reset(reset), .data(data), .split(split), .out_idx(out_idx), .out_data(red_out));
+
+    // filter the invalid output
+    logic out_idx_valid_reg [`N-1:0];
+    generate
+        for(genvar i = 0; i < `N; i++) begin
+            delay_shift #(.W(1), .DELAY_CYCLES(`delayPE)) out_idx_valid_delay_shift(.clock(clock), .reset(reset), .in(out_idx_valid[i]), .out(out_idx_valid_reg[i])); 
+            assign out[i] = out_idx_valid_reg[i] ? red_out[i] : 0;
+        end
+    endgenerate
 
 endmodule
 
