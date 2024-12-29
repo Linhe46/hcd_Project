@@ -126,7 +126,6 @@ module RedUnit #(parameter UPPER_DELAY = 0)(
 
     // Prefix sum logic: Hillis-Steele Scan Algorithm
     data_t pfx_sum [`lgN:0][`N-1:0];  // depth is lgN+1, width is N
-    //logic flag;
     data_t zero;
     assign zero.data = 0;
 
@@ -381,6 +380,7 @@ module PE(
         end
     endgenerate
 
+    // find the first partsum id
     logic flag;
     always_comb begin
         flag = 0;
