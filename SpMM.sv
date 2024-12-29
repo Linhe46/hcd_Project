@@ -6,8 +6,8 @@
 `define dbLgN (2*$clog2(`N))
 `define lglgN   ($clog2(`lgN))
 
-`define delayRedUnit    `lgN + 2
-`define delayPE        `delayRedUnit + 1
+`define delayRedUnit    `lgN + 1
+`define delayPE        `delayRedUnit + 2
 `define Vector 0
 `define Buffer 1
 
@@ -116,7 +116,8 @@ module RedUnit #(parameter UPPER_DELAY = 0)(
     input   logic [`lgN-1:0]    out_idx[`N-1:0],
     output  data_t              out_data[`N-1:0],
     output  int                 delay,
-    output  int                 num_el
+    output  int                 num_el,
+    output  data_t              halo_sum
 );
     // num_el 总是赋值为 N
     assign num_el = `N;
@@ -188,11 +189,20 @@ module RedUnit #(parameter UPPER_DELAY = 0)(
             else part_sum[i] <= 0;
     end
     
+    // halo adder logic
+    data_t halo_sum_reg;
     always_ff @(posedge clock) begin
+        if(reset) halo_sum_reg <= 0;
+        else if(split_reg[`N-1]) halo_sum_reg <= 0;
+        else halo_sum_reg <= pfx_sum[`lgN][`N-1] - pfx_sum[`lgN][partsum_head_idx[`N-1] - 1];
+    end
+
+    // delay 1 cycle to wait for out_data update
+    delay_shift #(.W(`W), .DELAY_CYCLES(1)) out_idx_delay_shift(.clock(clock), .reset(reset), .in(halo_sum_reg), .out(halo_sum)); 
+
+    always_comb begin
         for(int i = 0; i < `N; i++) begin
-            if(reset)
-                out_data[i] <= 0;
-            else out_data[i] <= part_sum[out_idx_reg[i]];
+            out_data[i] = part_sum[out_idx_reg[i]];
         end
     end
 
@@ -292,6 +302,25 @@ module PE(
         for(int i = 0; i < `N; i++)
             split_table[row_id[i]][col_id[i]] = 1;
     end
+
+    // deal with the output of zero lines in lhs
+    logic [`lgN-1:0] last_non_zero_id [`N-1:0];
+    logic [`lgN-1:0] zero_lines [`N-1:0]; // number of zero lines
+    always_comb begin
+        last_non_zero_id[0] = 0;
+        zero_lines[0] = 0; // first line must be non-zero
+        for(int i = 1; i < `N; i++) begin
+            if(lhs_ptr[i] == lhs_ptr[i-1]) begin
+                last_non_zero_id[i] = last_non_zero_id[i-1];
+                zero_lines[last_non_zero_id[i]] += 1;
+            end
+            else begin
+                last_non_zero_id[i] = i;
+                zero_lines[i] = 0;
+            end
+        end
+    end
+
     // update split according to lhs_ctr
     always_comb begin
         for(int i = 0; i < `N; i++)
@@ -299,23 +328,16 @@ module PE(
     end
 
     // out_idx according to split vector
-    logic [`lgN-1:0] split_ctr, split_row_id, done_row_ctr;
+    logic [`lgN-1:0] split_row_id, done_row_ctr;
     logic split_row_en;
-    always_comb begin
-        split_ctr = 0;
-        for(int i = 0; i < `N; i++)
-            split_ctr += split[i]; // a split means a row is done
-    end
     // if the final elment is not splited, the row is splited
     assign split_row_en = ~split[`N-1];
-    /*always_ff @(posedge clock) begin
-        if(reset) split_row_en <= 0;
-        else split_row_en <= ~split[`N-1];
-    end*/
+
     // count the done rows for the next row id
     always_ff @(posedge clock) begin
-        if(reset || !lhs_en) done_row_ctr <= 0;
-        else done_row_ctr <= done_row_ctr + split_ctr;
+        if(reset) done_row_ctr <= 0;
+        else if(!lhs_en) done_row_ctr <= 0;
+        else done_row_ctr <= done_row_ctr + out_idx_ctr;
     end 
 
     // out_idx generation logic
@@ -332,7 +354,7 @@ module PE(
             if(split[i]) begin
                 out_idx[done_row_ctr + out_idx_ctr] = i;
                 out_idx_valid[done_row_ctr + out_idx_ctr] = 1;
-                out_idx_ctr += 1;
+                out_idx_ctr += (zero_lines[done_row_ctr + out_idx_ctr] + 1); // modified for zero lines
             end
         end
     end
@@ -345,18 +367,38 @@ module PE(
         end
     endgenerate
 
+    data_t halo_sum;
+    logic [`lgN-1:0] halo_id;
     data_t red_out [`N-1:0];
     // instantiate RedUnit (1 additional delay from data's multiplication)
-    RedUnit #(.UPPER_DELAY(1)) PE_REDUNIT(.clock(clock), .reset(reset), .data(data), .split(split), .out_idx(out_idx), .out_data(red_out));
+    RedUnit #(.UPPER_DELAY(1)) PE_REDUNIT(.clock(clock), .reset(reset), .data(data), .split(split), .out_idx(out_idx), .out_data(red_out), .halo_sum(halo_sum));
 
     // filter the invalid output
     logic out_idx_valid_reg [`N-1:0];
     generate
         for(genvar i = 0; i < `N; i++) begin
-            delay_shift #(.W(1), .DELAY_CYCLES(`delayPE)) out_idx_valid_delay_shift(.clock(clock), .reset(reset), .in(out_idx_valid[i]), .out(out_idx_valid_reg[i])); 
-            assign out[i] = out_idx_valid_reg[i] ? red_out[i] : 0;
+            delay_shift #(.W(1), .DELAY_CYCLES(`delayPE - 1)) out_idx_valid_delay_shift(.clock(clock), .reset(reset), .in(out_idx_valid[i]), .out(out_idx_valid_reg[i])); 
         end
     endgenerate
+
+    logic flag;
+    always_comb begin
+        flag = 0;
+        for(int i = 0; i < `N; i++) begin
+            if(out_idx_valid_reg[i] && ~flag) begin
+                flag = 1;
+                halo_id = i;
+            end
+        end
+    end
+
+    always_ff @(posedge clock) begin
+        for(int i = 0; i < `N; i++) begin
+            if(reset) out[i] <= 0;
+            else if(i == halo_id) out[i] <= red_out[i] + halo_sum;
+            else out[i] <= out_idx_valid_reg[i] ? red_out[i] : 0;
+        end
+    end
 
 endmodule
 
