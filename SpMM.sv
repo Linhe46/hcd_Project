@@ -384,6 +384,7 @@ module PE(
     logic flag;
     always_comb begin
         flag = 0;
+        halo_id = 0;
         for(int i = 0; i < `N; i++) begin
             if(out_idx_valid_reg[i] && ~flag) begin
                 flag = 1;
@@ -399,6 +400,100 @@ module PE(
             else out[i] <= out_idx_valid_reg[i] ? red_out[i] : 0;
         end
     end
+
+endmodule
+
+module rhs_dbbuf(
+    input   logic               clock,
+                                reset,
+    input   logic               wr_en,
+    input   logic               rd_en,
+    input   data_t              rhs_data [3:0][`N-1:0],
+    output  data_t              data [`N-1:0][`N-1:0],
+    output  logic               wr_valid,
+    output  logic               rd_valid
+);
+
+    data_t rhs_buffer [1:0][`N-1:0][`N-1:0]; // two arrays
+    logic wr_sel, rd_sel;
+    logic [1:0] rd_ready;
+    logic [1:0] wr_ready;
+    logic [`lgN-1:0] wr_ptr;
+    assign rd_sel = ~wr_sel;
+
+
+    // write logic
+    always_ff @(posedge clock) begin
+        for(int i = 0; i < 4; i++) begin
+            for(int j = 0; j < `N; j++) begin
+                if(wr_en && wr_ready[wr_sel])
+                    rhs_buffer[wr_sel][j][wr_ptr * 4 + i] <= rhs_data[i][j]; // store RHS_T in the buffer
+                else
+                    rhs_buffer[wr_sel][i][j] <= rhs_buffer[wr_sel][i][j];
+            end
+        end
+    end
+
+    always_ff @(posedge clock) begin
+        if(reset) wr_ptr <= 0;
+        else if(wr_en && wr_ptr != `N/4-1)
+            wr_ptr <= wr_ptr + 1;
+        else wr_ptr <= 0;
+    end
+
+    always_ff @(posedge clock) begin
+        if(reset) begin
+            wr_ready[wr_sel] <= 1;
+            rd_ready[wr_sel] <= 0;
+        end
+        else begin
+            if(wr_en && wr_ptr == `N/4-1) begin
+                wr_ready[wr_sel] <= 0;
+                rd_ready[wr_sel] <= 1;
+            end
+            else if(wr_en && wr_ptr != `N/4-1) begin
+                wr_ready[wr_sel] <= 1;
+                rd_ready[wr_sel] <= 0;
+            end
+            else begin
+                wr_ready[wr_sel] <= 1;
+                rd_ready[wr_sel] <= rd_ready[wr_sel];
+            end
+        end
+    end
+
+    // read logic
+    always_comb begin
+        for(int i = 0; i < `N; i++) begin
+            for(int j = 0; j < `N; j++) begin
+                if(rd_en && rd_ready[rd_sel])
+                    data[i][j] = rhs_buffer[rd_sel][i][j];
+                else
+                    data[i][j] = 0;
+            end
+        end
+    end
+
+    always_ff @(posedge clock) begin
+        if(reset) begin
+            wr_ready[rd_sel] <= 1;
+            rd_ready[rd_sel] <= 0;
+        end
+        else if(rd_en && rd_ready[rd_sel]) begin
+            wr_ready[rd_sel] <= 1;
+        end
+    end
+    
+    // switch
+    always_ff @(posedge clock) begin
+        if(reset) wr_sel <= 0;
+        else if(!rd_en)
+            wr_sel <= wr_ready[0] ? 0 : wr_ready[1] ? 1 :0;
+        else wr_sel <= wr_sel;
+    end
+
+    assign wr_valid = | wr_ready;
+    assign rd_valid = | rd_ready;
 
 endmodule
 
@@ -451,9 +546,6 @@ module SpMM(
     //assign out_ready = 0;
 
     // detect the start signal
-    //`START_DETECTOR(rhs_detector, Buffer, rhs_start, rhs_en, rhs_ctr)
-    //`START_DETECTOR(out_detector, Buffer, out_start, out_en, out_ctr)
-    //`START_DETECTOR(out_detector, Buffer, out_start, out_en, out_ctr)
     logic rhs_en, out_en;
     logic [`lgN-1:0] rhs_ctr, out_ctr;
     StartDetector #(.Type(`Buffer)) rhs_buffer_detector (.clock(clock), .reset(reset), .start(rhs_start), .en(rhs_en), .ctr_(rhs_ctr));
@@ -466,7 +558,7 @@ module SpMM(
     //assign rhs_ready = input_state == IDLE;
     always_ff @(posedge clock) begin
         if(reset) rhs_ready <= 0;
-        else rhs_ready <= input_state == IDLE && !rhs_start;
+        else rhs_ready <= input_state == IDLE && !rhs_start || input_state == REC_RHS;
     end
     //assign lhs_ready_ns = input_state == REC_RHS && !rhs_en;
     always_ff @(posedge clock) begin
@@ -481,9 +573,7 @@ module SpMM(
     
     logic [`N-1:0] delay_ctr, delay_ctr_next;
     logic delay_started, delay_en;
-    //logic [`N-1:0] end_sign = `delayPE - 1;
-    //logic [`N-1:0] end_sign = `delayPE;
-    logic [`N-1:0] end_sign = `delayPE ; //for debugging    
+    logic [`N-1:0] end_sign = `delayPE ;
     
     assign delay_en = lhs_start || delay_started;
     assign delay_ctr_next = delay_en ? delay_ctr + 1 : delay_ctr;
@@ -502,7 +592,9 @@ module SpMM(
         next_input_state = input_state;
         case(input_state)
             IDLE: next_input_state = rhs_start ? REC_RHS : input_state;
-            REC_RHS: next_input_state = rhs_en ? REC_RHS : REC_LHS;
+            //REC_RHS: next_input_state = rhs_en ? REC_RHS : REC_LHS;
+            REC_RHS: next_input_state = lhs_en ? REC_LHS : REC_RHS;
+            //REC_LHS: next_input_state = lhs_en ? REC_LHS : UPDATE_OUT;
             REC_LHS: next_input_state = lhs_en ? REC_LHS : UPDATE_OUT;
             UPDATE_OUT: next_input_state = out_col_en ? UPDATE_OUT : DONE;
             //CALC: next_input_state = delay_ctr == end_sign ? DONE : CALC;
@@ -516,7 +608,7 @@ module SpMM(
 
     always_ff @(posedge clock) begin
         if(reset) out_ready <= 0;
-        else out_ready <= out_col_ctr == `N-1;
+        else out_ready <= out_col_ctr == `N-1; // last column loaded
     end
     always_ff @(posedge clock) begin
         if(reset) output_state <= IDLE; 
@@ -534,7 +626,8 @@ module SpMM(
     logic [`lgN-1:0] out_col_ctr, out_col_ctr_next;
     logic out_col_en, out_col_start, out_col_started;
 
-    assign out_col_start = delay_ctr == end_sign;
+    // load the out_col to buffer
+    assign out_col_start = delay_ctr == end_sign; // first column done
     assign out_col_ctr_next = out_col_en ? out_col_ctr + 1 : out_col_ctr; // if there is redundant?
     assign out_col_en = out_col_start || out_col_started;
     always_ff @(posedge clock) begin
@@ -555,20 +648,16 @@ module SpMM(
         for(int i = 0; i < 4; i++) begin
             for(int j = 0; j < `N; j++) begin
                 if(rhs_en)
-                    //rhs_buffer[rhs_ctr * 4 + i][j] <= rhs_data[i][j];
-                    rhs_buffer[j][rhs_ctr * 4 + i] <= rhs_data[i][j]; // store RHS_T in the buffer?
+                    rhs_buffer[j][rhs_ctr * 4 + i] <= rhs_data[i][j]; // store RHS_T in the buffer
             end
         end
     end
-    // output the result
-    /*always_ff @(posedge clock) begin
-        for(int i = 0; i < 4; i++) begin
-            for(int j = 0; j< `N; j++) begin
-                if(out_en)
-                    out_data[i][j] <= out_buffer[i][j];   //synchronization problem??
-            end
-        end
-    end*/
+
+    //data_t test_rhs_dbbuf [`N-1:0][`N-1:0];
+    /*logic test_rhs_dbbuf_wr_valid, test_rhs_dbbuf_rd_valid;
+    data_t rhs_dbbuf_out [`N-1:0][`N-1:0];
+    rhs_dbbuf rhs_dbbuf_u (.clock(clock), .reset(reset), .wr_en(rhs_en), .rd_en(lhs_en),
+                        .rhs_data(rhs_data), .data(rhs_dbbuf_out), .wr_valid(test_rhs_dbbuf_wr_valid), .rd_valid(test_rhs_dbbuf_rd_valid));*/
 
     // OUT Send Logic
     always_comb begin
@@ -609,12 +698,6 @@ module SpMM(
         end
     endgenerate
     // Offload the column vectors to the out_buffer
-    /*
-    always_ff @(posedge clock) begin
-        for(int j = 0; j < `N; j++) begin
-                out_buffer[out_col_ctr][j] = out_col_en ? pe_out_cols[j][`N-1] : 0; // for 60 pts, no split and out_idx
-        end 
-    end*/
     always_ff @(posedge clock) begin
         for(int j = 0; j < `N; j++) begin
             for(int i = 0; i < `N; i++) begin
@@ -628,6 +711,7 @@ module SpMM(
         end
     end
 
+    /*
     // debug print in a text file
     integer file = $fopen("output.txt", "w");
     // register debugging functions
@@ -642,6 +726,6 @@ module SpMM(
         $fdisplay(file, "lhs_start = %b, lhs_ready_ns = %b", lhs_start, lhs_ready_ns);
         $fdisplay(file, "lhs_data: "); print_lhs();
         $fdisplay(file, "out_buffer: "); print_out_buffer();
-    end
+    end*/
 
 endmodule
