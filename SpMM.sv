@@ -409,6 +409,7 @@ module rhs_dbbuf(
     input   logic               wr_en,
     input   logic               rd_en,
     input   data_t              rhs_data [3:0][`N-1:0],
+    input   logic               rd_ws, // weight-stationary read, not discard
     output  data_t              data [`N-1:0][`N-1:0],
     output  logic               wr_valid,
     output  logic               rd_valid
@@ -420,7 +421,6 @@ module rhs_dbbuf(
     logic [1:0] wr_ready;
     logic [`lgN-1:0] wr_ptr;
     assign rd_sel = ~wr_sel;
-
 
     // write logic
     always_ff @(posedge clock) begin
@@ -480,7 +480,8 @@ module rhs_dbbuf(
             rd_ready[rd_sel] <= 0;
         end
         else if(rd_en && rd_ready[rd_sel]) begin
-            wr_ready[rd_sel] <= 1;
+            wr_ready[rd_sel] <= rd_ws ? 0 : 1; // if rd_ws, not writable, still readable
+            rd_ready[rd_sel] <= rd_ws ? 1 : 0;
         end
     end
     
@@ -551,129 +552,109 @@ module SpMM(
     StartDetector #(.Type(`Buffer)) rhs_buffer_detector (.clock(clock), .reset(reset), .start(rhs_start), .en(rhs_en), .ctr_(rhs_ctr));
     StartDetector #(.Type(`Buffer)) out_buffer_detector (.clock(clock), .reset(reset), .start(out_start), .en(out_en), .ctr_(out_ctr));
 
-    // ready logic
-    // lhs_ready_ns, rhs_ready and out_ready
-    localparam IDLE = 0, REC_RHS = 1, REC_LHS = 2, DONE = 3, UPDATE_OUT = 4, SEND_OUT = 5;
-    logic [2:0] input_state, next_input_state;
-    //assign rhs_ready = input_state == IDLE;
-    always_ff @(posedge clock) begin
-        if(reset) rhs_ready <= 0;
-        else rhs_ready <= input_state == IDLE && !rhs_start || input_state == REC_RHS;
-    end
-    //assign lhs_ready_ns = input_state == REC_RHS && !rhs_en;
-    always_ff @(posedge clock) begin
-        if(reset) lhs_ready_ns <= 0;
-        else lhs_ready_ns <= input_state == REC_RHS && !rhs_en && !lhs_start;
-    end
+    //----------------------rhs_buffer logic--------------------------------
+    data_t rhs_buffer [1:0][`N-1:0][`N-1:0];
+    data_t rhs_out [`N-1:0][`N-1:0];
+    logic [`lgN-1:0] rhs_wr_ptr;
 
-    always_ff @(posedge clock) begin
-        if(reset) input_state <= IDLE;
-        else input_state <= next_input_state;
-    end
+    // 0 for empty or discard, 1 for writing, 2 for ready to read
+    localparam EMPTY = 0, BUSY_WRITE = 1, READY_READ = 2;
+    logic [1:0] rhs_buffer_state [1:0]; 
+    logic [1:0] rhs_buffer_next_state [1:0];
     
-    logic [`N-1:0] delay_ctr, delay_ctr_next;
-    logic delay_started, delay_en;
-    logic [`N-1:0] end_sign = `delayPE ;
-    
-    assign delay_en = lhs_start || delay_started;
-    assign delay_ctr_next = delay_en ? delay_ctr + 1 : delay_ctr;
-
     always_ff @(posedge clock) begin
-        if(reset) delay_started <= 0;
-        else delay_started <= delay_ctr != end_sign && delay_ctr != 0 || lhs_start;
-    end
-
-    always_ff @(posedge clock) begin
-        if(reset) delay_ctr <= 0;
-        else delay_ctr <= delay_ctr_next;
+        for(int i = 0; i < 2; i++) begin
+            if(reset)
+                rhs_buffer_state[i] <= EMPTY;
+            else 
+                rhs_buffer_state[i] <= rhs_buffer_next_state[i];
+        end
     end
 
     always_comb begin
-        next_input_state = input_state;
-        case(input_state)
-            IDLE: next_input_state = rhs_start ? REC_RHS : input_state;
-            //REC_RHS: next_input_state = rhs_en ? REC_RHS : REC_LHS;
-            REC_RHS: next_input_state = lhs_en ? REC_LHS : REC_RHS;
-            //REC_LHS: next_input_state = lhs_en ? REC_LHS : UPDATE_OUT;
-            REC_LHS: next_input_state = lhs_en ? REC_LHS : UPDATE_OUT;
-            UPDATE_OUT: next_input_state = out_col_en ? UPDATE_OUT : DONE;
-            //CALC: next_input_state = delay_ctr == end_sign ? DONE : CALC;
-            DONE: next_input_state = IDLE;
-        endcase 
-    end
-
-    logic [2:0] output_state, next_output_state;
-    //assign out_ready = output_state == IDLE && input_state == DONE;
-    //assign out_ready = output_state == IDLE && delay_ctr == end_sign;
-
-    always_ff @(posedge clock) begin
-        if(reset) out_ready <= 0;
-        else out_ready <= out_col_ctr == `N-1; // last column loaded
-    end
-    always_ff @(posedge clock) begin
-        if(reset) output_state <= IDLE; 
-        else output_state <= next_output_state;
-    end
-    always_comb begin
-        next_output_state = output_state;
-        case(output_state)
-            IDLE: next_output_state = out_start ? SEND_OUT : output_state;
-            SEND_OUT: next_output_state = out_en ? SEND_OUT : DONE;
-            DONE: next_output_state = IDLE;
+        case(rhs_buffer_state[1])
+            EMPTY : rhs_buffer_next_state[1] = rhs_start ? BUSY_WRITE : EMPTY;
+            BUSY_WRITE : rhs_buffer_next_state[1] = rhs_wr_ptr == `N/4-1 ? READY_READ : BUSY_WRITE; 
+            READY_READ : rhs_buffer_next_state[1] = rhs_update ? EMPTY : READY_READ; // if updated, allow next input
+        endcase
+        case(rhs_buffer_state[0])
+            EMPTY : rhs_buffer_next_state[0] = rhs_update ? READY_READ : EMPTY;
+            READY_READ : rhs_buffer_next_state[0] = rhs_rd_en ? EMPTY : READY_READ; // if read out, discard
         endcase
     end
 
-    logic [`lgN-1:0] out_col_ctr, out_col_ctr_next;
-    logic out_col_en, out_col_start, out_col_started;
-
-    // load the out_col to buffer
-    assign out_col_start = delay_ctr == end_sign; // first column done
-    assign out_col_ctr_next = out_col_en ? out_col_ctr + 1 : out_col_ctr; // if there is redundant?
-    assign out_col_en = out_col_start || out_col_started;
     always_ff @(posedge clock) begin
-        if(reset) out_col_ctr <= 0;
-        else out_col_ctr <= out_col_ctr_next;
-    end
-    always_ff @(posedge clock) begin
-        if(reset) out_col_started <= 0;
-        else out_col_started <= out_col_start || (out_col_ctr != `N-1 && out_col_ctr != 0);
+        if(reset) rhs_ready <= 0;
+        else rhs_ready <= rhs_buffer_state[1] == EMPTY && !rhs_start;
     end
 
-    // input/output buffer
-    data_t rhs_buffer [`N-1:0][`N-1:0];
-    data_t out_buffer [`N-1:0][`N-1:0];
-    
-    // RHS Read Logic
+    logic rhs_update;
+    assign rhs_update = rhs_buffer_state[1] == READY_READ && rhs_buffer_state[0] != READY_READ;
+
+    logic  rhs_wr_en, rhs_rd_en;
+    assign rhs_wr_en = rhs_en;
+    assign rhs_rd_en = lhs_start;
+    // read logic
+    always_ff @(posedge clock) begin
+        for(int i = 0; i < `N; i++) begin
+            for(int j = 0; j < `N; j++)
+                if(reset)
+                    rhs_buffer[0][i][j] <= 0;
+                else if(rhs_update) // read done, discard the matrix and update
+                    rhs_buffer[0][i][j] <= rhs_buffer[1][i][j];
+                else 
+                    rhs_buffer[0][i][j] <= rhs_buffer[0][i][j];
+        end
+    end
+    always_ff @(posedge clock) begin
+        for(int i = 0; i < `N; i++) begin
+            for(int j = 0; j < `N; j++) begin
+                if(reset) rhs_out[i][j] <= 0;
+                else if(rhs_buffer_state[0] == READY_READ) rhs_out[i][j] <= rhs_buffer[0][i][j];
+                else rhs_out[i][j] <= rhs_out[i][j];
+            end
+        end
+    end
+
+    // write logic
+    always_ff @(posedge clock) begin
+        for(int i = 0; i < `N; i++) begin
+            for(int j = 0; j < `N; j++) begin
+                if(reset)
+                    rhs_buffer[1][i][j] <= 0;
+            end
+        end
+    end
     always_ff @(posedge clock) begin
         for(int i = 0; i < 4; i++) begin
             for(int j = 0; j < `N; j++) begin
-                if(rhs_en)
-                    rhs_buffer[j][rhs_ctr * 4 + i] <= rhs_data[i][j]; // store RHS_T in the buffer
+                if(rhs_wr_en)
+                    rhs_buffer[1][j][rhs_wr_ptr * 4 + i] <= rhs_data[i][j]; // store RHS_T in the buffer
+                else
+                    rhs_buffer[1][i][j] <= rhs_buffer[1][i][j];
             end
         end
     end
 
-    //data_t test_rhs_dbbuf [`N-1:0][`N-1:0];
-    /*logic test_rhs_dbbuf_wr_valid, test_rhs_dbbuf_rd_valid;
-    data_t rhs_dbbuf_out [`N-1:0][`N-1:0];
-    rhs_dbbuf rhs_dbbuf_u (.clock(clock), .reset(reset), .wr_en(rhs_en), .rd_en(lhs_en),
-                        .rhs_data(rhs_data), .data(rhs_dbbuf_out), .wr_valid(test_rhs_dbbuf_wr_valid), .rd_valid(test_rhs_dbbuf_rd_valid));*/
-
-    // OUT Send Logic
-    always_comb begin
-        for(int i = 0; i < 4; i++) begin
-            for(int j = 0; j< `N; j++) begin
-                out_data[i][j] = out_en ? out_buffer[i + out_ctr * 4][j] : 0;
-            end
-        end
+    always_ff @(posedge clock) begin
+        if(reset) rhs_wr_ptr <= 0;
+        else if(rhs_wr_en && rhs_wr_ptr != `N/4-1)
+            rhs_wr_ptr <= rhs_wr_ptr + 1;
+        else rhs_wr_ptr <= 0;
     end
-    
+
+    always_ff @(posedge clock) begin
+        if(reset) lhs_ready_ns <= 0;
+        else lhs_ready_ns <= rhs_buffer_state[0] == READY_READ && !lhs_start;
+    end
+    //----------------------rhs_buffer logic--------------------------------
+
     // Instantiate N PEs in parallel
     logic lhs_en;
     data_t pe_out_cols [`N-1:0][`N-1:0];
     logic pe_out_cols_valid [`N-1:0];
     logic pe_out_cols_valid_delayed [`N-1:0]; // delay the PE valid flags for output
-    
+
     generate
         for(genvar i = 0; i < `N; i++) begin
             delay_shift #(.W(1), .DELAY_CYCLES(`delayPE)) pe_out_cols_valid_delay_shift(
@@ -688,7 +669,8 @@ module SpMM(
                 .lhs_ptr(lhs_ptr),
                 .lhs_col(lhs_col),
                 .lhs_data(lhs_data),
-                .rhs(rhs_buffer[i]),
+                //.rhs(rhs_buffer[i]),
+                .rhs(rhs_buffer[0][i]),
                 .out(pe_out_cols[i]), // output column vectors
                 .delay(),
                 .num_el(),
@@ -697,35 +679,109 @@ module SpMM(
             );
         end
     endgenerate
-    // Offload the column vectors to the out_buffer
+
+    // generate load columns ready signal by PE delay
+    logic out_col_start, out_col_en;
+    logic [`lgN-1:0] out_col_ctr;
+    delay_shift #(.W(1), .DELAY_CYCLES(`delayPE)) 
+        delay_lhs_start_to_out_ready(.clock(clock), .reset(reset), .in(lhs_start), .out(out_col_start));
+    StartDetector #(.Type(`Vector)) out_col_detector(.clock(clock), .reset(reset), 
+        .start(out_col_start), .en(out_col_en), .ctr_(out_col_ctr));
+
+    /*// generate out_ready signal after loading
+    always_ff @(posedge clock) begin
+        if(reset) out_ready <= 0;
+        else out_ready <= out_col_ctr == `N-1; // last column loaded
+    end*/
+    //----------------------out_dbbuf logic--------------------------------
+
+    data_t out_buffer [1:0][`N-1:0][`N-1:0];
+
+    localparam BUSY_SENDOUT = 1, READY_OUTPUT = 2, BUSY_OFFLOAD = 3;
+    logic [1:0] out_buffer_state [1:0];
+    logic [1:0] out_buffer_next_state [1:0];
+
+    // FSM definition
+    always_ff @(posedge clock) begin
+        for(int i = 0; i < 2; i++) begin
+            if(reset)
+                out_buffer_state[i] <= EMPTY;
+            else
+                out_buffer_state[i] <= out_buffer_next_state[i];
+        end
+    end
+    always_comb begin
+        case(out_buffer_state[0])
+            EMPTY : out_buffer_next_state[0] = out_dbbuf_update ? READY_OUTPUT : EMPTY;
+            READY_OUTPUT : out_buffer_next_state[0] = out_start ? BUSY_SENDOUT : READY_OUTPUT;
+            BUSY_SENDOUT : out_buffer_next_state[0] = out_ptr == `N/4-1 ? EMPTY : BUSY_SENDOUT;
+        endcase
+        case(out_buffer_state[1])
+            EMPTY : out_buffer_next_state[1] = out_col_start ? BUSY_OFFLOAD : EMPTY;
+            BUSY_OFFLOAD : out_buffer_next_state[1] = out_col_ctr == `N-1 ? READY_OUTPUT : BUSY_OFFLOAD;
+            READY_OUTPUT : out_buffer_next_state[1] = out_dbbuf_update ? EMPTY : READY_OUTPUT;
+        endcase
+    end  
+
+    logic out_dbbuf_update;
+    assign out_dbbuf_update = out_buffer_state[1] == READY_OUTPUT && out_buffer_state[0] != READY_OUTPUT;
+
+    logic  out_wr_en, out_rd_en;
+
+    assign out_wr_en = out_col_en;
+    assign out_rd_en = out_en;    
+
+    // load PE result columns(write) logic
     always_ff @(posedge clock) begin
         for(int j = 0; j < `N; j++) begin
             for(int i = 0; i < `N; i++) begin
-                if(pe_out_cols_valid_delayed[i]) begin
-                    out_buffer[i][j] <= pe_out_cols[j][i];
-                end
-                else begin
-                    out_buffer[i][j] <= out_buffer[i][j];
-                end
+                if(reset) out_buffer[1][i][j] <= 0;
+                else if(out_wr_en && pe_out_cols_valid_delayed[i])
+                    out_buffer[1][i][j] <= pe_out_cols[j][i];
+                else out_buffer[1][i][j] <= out_buffer[1][i][j];
             end
         end
     end
 
-    /*
-    // debug print in a text file
-    integer file = $fopen("output.txt", "w");
-    // register debugging functions
-    `PRINT_ARRAY(print_rhs, 4, `N, rhs_data)
-    `PRINT_ARRAY(print_rhs_buffer, `N, `N, rhs_buffer)
-    `PRINT_ARRAY(print_out_buffer, `N, `N, out_buffer)
-    `PRINT_ARRAY(print_lhs, 1, `N, lhs_data)
-
-    always @(posedge clock or negedge clock) begin
-        $fdisplay(file, "rhs input: "); print_rhs();
-        $fdisplay(file, "rhs_buffer: "); print_rhs_buffer();
-        $fdisplay(file, "lhs_start = %b, lhs_ready_ns = %b", lhs_start, lhs_ready_ns);
-        $fdisplay(file, "lhs_data: "); print_lhs();
-        $fdisplay(file, "out_buffer: "); print_out_buffer();
+    // sendout out_buffer[0](read) logic
+    always_ff @(posedge clock) begin
+        for(int i = 0; i < `N; i++) begin
+            for(int j = 0; j < `N; j++) begin
+                if(reset)
+                    out_buffer[0][i][j] <= 0;
+                else if(out_dbbuf_update)
+                    out_buffer[0][i][j] <= out_buffer[1][i][j];
+                else
+                    out_buffer[0][i][j] <= out_buffer[0][i][j];
+            end
+        end
+    end
+    /*always_ff @(posedge clock) begin
+        for(int i = 0; i < 4; i++) begin
+            for(int j = 0; j < `N; j++) begin
+                if(out_rd_en)
+                    out_data[i][j] <= out_buffer[0][i + out_ptr * 4][j];
+                else out_data[i][j] <= 0;
+            end
+        end
     end*/
+    always_comb begin
+        for(int i = 0; i < 4; i++) begin
+            for(int j = 0; j < `N; j++) begin
+                out_data[i][j] <= out_buffer[0][i + out_ptr * 4][j];
+            end
+        end
+    end
+
+    logic [`lgN-1:0] out_ptr;
+    assign out_ptr = out_ctr;
+
+    always_ff @(posedge clock) begin
+        if(reset) out_ready <= 0;
+        else out_ready <= out_buffer_state[0] == READY_OUTPUT && !out_start; 
+    end
+
+    //----------------------out_dbbuf logic--------------------------------
+
 
 endmodule
