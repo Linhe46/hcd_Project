@@ -268,7 +268,6 @@ module PE(
     output  data_t              out[`N-1:0],
     output  int                 delay,
     output  int                 num_el
-    ,output logic lhs_en // used for SpMM ctrl
     ,output logic out_idx_valid [`N-1:0] // used for SpMM output
 );
     // num_el 总是赋值为 N
@@ -547,10 +546,11 @@ module SpMM(
     //assign out_ready = 0;
 
     // detect the start signal
-    logic rhs_en, out_en;
-    logic [`lgN-1:0] rhs_ctr, out_ctr;
+    logic rhs_en, out_en, lhs_en;
+    logic [`lgN-1:0] rhs_ctr, out_ctr, lhs_ctr;
     StartDetector #(.Type(`Buffer)) rhs_buffer_detector (.clock(clock), .reset(reset), .start(rhs_start), .en(rhs_en), .ctr_(rhs_ctr));
     StartDetector #(.Type(`Buffer)) out_buffer_detector (.clock(clock), .reset(reset), .start(out_start), .en(out_en), .ctr_(out_ctr));
+    StartDetector #(.Type(`Vector)) lhs_data_detector (.clock(clock), .reset(reset), .start(lhs_start), .en(lhs_en), .ctr_(lhs_ctr));
 
     //----------------------rhs_buffer logic--------------------------------
     data_t rhs_buffer [1:0][`N-1:0][`N-1:0];
@@ -558,7 +558,7 @@ module SpMM(
     logic [`lgN-1:0] rhs_wr_ptr;
 
     // 0 for empty or discard, 1 for writing, 2 for ready to read
-    localparam EMPTY = 0, BUSY_WRITE = 1, READY_READ = 2;
+    localparam EMPTY = 0, BUSY_WRITE = 1, READY_READ = 2, BUSY_READ = 3;
     logic [1:0] rhs_buffer_state [1:0]; 
     logic [1:0] rhs_buffer_next_state [1:0];
     
@@ -579,7 +579,7 @@ module SpMM(
         endcase
         case(rhs_buffer_state[0])
             EMPTY : rhs_buffer_next_state[0] = rhs_update ? READY_READ : EMPTY;
-            READY_READ : rhs_buffer_next_state[0] = rhs_rd_en ? EMPTY : READY_READ; // if read out, discard
+            READY_READ : rhs_buffer_next_state[0] = lhs_ctr == `N-1 ? EMPTY : READY_READ; // if read out, discard
         endcase
     end
 
@@ -593,7 +593,7 @@ module SpMM(
 
     logic  rhs_wr_en, rhs_rd_en;
     assign rhs_wr_en = rhs_en;
-    assign rhs_rd_en = lhs_start;
+    assign rhs_rd_en = lhs_en;
     // read logic
     always_ff @(posedge clock) begin
         for(int i = 0; i < `N; i++) begin
@@ -610,7 +610,7 @@ module SpMM(
         for(int i = 0; i < `N; i++) begin
             for(int j = 0; j < `N; j++) begin
                 if(reset) rhs_out[i][j] <= 0;
-                else if(rhs_buffer_state[0] == READY_READ) rhs_out[i][j] <= rhs_buffer[0][i][j];
+                else if(rhs_buffer_state[0] == READY_READ && rhs_rd_en) rhs_out[i][j] <= rhs_buffer[0][i][j];
                 else rhs_out[i][j] <= rhs_out[i][j];
             end
         end
@@ -650,7 +650,6 @@ module SpMM(
     //----------------------rhs_buffer logic--------------------------------
 
     // Instantiate N PEs in parallel
-    logic lhs_en;
     data_t pe_out_cols [`N-1:0][`N-1:0];
     logic pe_out_cols_valid [`N-1:0];
     logic pe_out_cols_valid_delayed [`N-1:0]; // delay the PE valid flags for output
@@ -674,7 +673,6 @@ module SpMM(
                 .out(pe_out_cols[i]), // output column vectors
                 .delay(),
                 .num_el(),
-                .lhs_en(lhs_en), // ensure produce the total output matrix
                 .out_idx_valid(pe_out_cols_valid) // only output the valid value to buffer
             );
         end
@@ -768,7 +766,7 @@ module SpMM(
     always_comb begin
         for(int i = 0; i < 4; i++) begin
             for(int j = 0; j < `N; j++) begin
-                out_data[i][j] <= out_buffer[0][i + out_ptr * 4][j];
+                out_data[i][j] = out_rd_en ? out_buffer[0][i + out_ptr * 4][j] : 0;
             end
         end
     end
