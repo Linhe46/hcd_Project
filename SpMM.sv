@@ -645,7 +645,7 @@ module SpMM(
 
     always_ff @(posedge clock) begin
         if(reset) lhs_ready_ns <= 0;
-        else lhs_ready_ns <= rhs_buffer_state[0] == READY_READ && !lhs_start;
+        else lhs_ready_ns <= rhs_buffer_state[0] == READY_READ && !lhs_start && !lhs_en;
     end
     //----------------------rhs_buffer logic--------------------------------
 
