@@ -277,6 +277,7 @@ module PE(
     assign delay = `delayPE;
     
     // get the enable signal and counter
+    logic lhs_en;
     logic [`lgN-1:0] lhs_ctr;
     StartDetector #(.Type(`Vector)) lhs_detector(.clock(clock), .reset(reset), .start(lhs_start), .en(lhs_en), .ctr_(lhs_ctr));
 
@@ -539,9 +540,9 @@ module SpMM(
     assign num_el = `N;
 
     //assign lhs_ready_ns = 0;
-    assign lhs_ready_ws = 0;
-    assign lhs_ready_os = 0;
-    assign lhs_ready_wos = 0;
+    //assign lhs_ready_ws = 0;
+    //assign lhs_ready_os = 0;
+    //assign lhs_ready_wos = 0;
     //assign rhs_ready = 0;
     //assign out_ready = 0;
 
@@ -551,6 +552,14 @@ module SpMM(
     StartDetector #(.Type(`Buffer)) rhs_buffer_detector (.clock(clock), .reset(reset), .start(rhs_start), .en(rhs_en), .ctr_(rhs_ctr));
     StartDetector #(.Type(`Buffer)) out_buffer_detector (.clock(clock), .reset(reset), .start(out_start), .en(out_en), .ctr_(out_ctr));
     StartDetector #(.Type(`Vector)) lhs_data_detector (.clock(clock), .reset(reset), .start(lhs_start), .en(lhs_en), .ctr_(lhs_ctr));
+    // ws and os signal
+    logic lhs_ws_en;
+    logic [`lgN-1:0] lhs_ws_ctr;
+    StartDetector #(.Type(`Vector)) lhs_ws_data_detector (.clock(clock), .reset(reset), .start(lhs_ws), .en(lhs_ws_en), .ctr_(lhs_ws_ctr));
+    logic lhs_os_en;
+    logic [`lgN-1:0] lhs_os_ctr;
+    StartDetector #(.Type(`Vector)) lhs_os_data_detector (.clock(clock), .reset(reset), .start(lhs_os), .en(lhs_os_en), .ctr_(lhs_os_ctr));
+    assign lhs_ready_wos = lhs_ready_ws &&  lhs_ready_os;
 
     //----------------------rhs_buffer logic--------------------------------
     data_t rhs_buffer [1:0][`N-1:0][`N-1:0];
@@ -579,7 +588,8 @@ module SpMM(
         endcase
         case(rhs_buffer_state[0])
             EMPTY : rhs_buffer_next_state[0] = rhs_update ? READY_READ : EMPTY;
-            READY_READ : rhs_buffer_next_state[0] = lhs_ctr == `N-1 ? EMPTY : READY_READ; // if read out, discard
+            //READY_READ : rhs_buffer_next_state[0] = lhs_ctr == `N-1 ? EMPTY : READY_READ; // if read out, discard
+            READY_READ : rhs_buffer_next_state[0] = lhs_ctr == `N-1 ? (lhs_ws_en ? READY_READ : EMPTY) : READY_READ; // add ws logic
         endcase
     end
 
@@ -645,7 +655,21 @@ module SpMM(
 
     always_ff @(posedge clock) begin
         if(reset) lhs_ready_ns <= 0;
-        else lhs_ready_ns <= rhs_buffer_state[0] == READY_READ && !lhs_start && !lhs_en;
+        //else lhs_ready_ns <= rhs_buffer_state[0] == READY_READ && !lhs_start && !lhs_en;
+        // only when the result is outputed, lhs_ns can be high
+        else lhs_ready_ns <= rhs_buffer_state[0] == READY_READ && !lhs_start && !lhs_en && out_buffer_state[0] != READY_OUTPUT;
+    end
+
+    // ws ready logic
+    always_ff @(posedge clock) begin
+        if(reset) lhs_ready_ws <= 0;
+        //else lhs_ready_ws <= rhs_buffer_state[0] == READY_READ && !lhs_start && !lhs_en; 
+        else lhs_ready_ws <= rhs_buffer_state[0] == READY_READ && !lhs_start && !lhs_en && out_buffer_state[0] != READY_OUTPUT;
+    end
+    // os ready logic
+    always_ff @(posedge clock) begin
+        if(reset) lhs_ready_os <= 0;
+        else lhs_ready_os <= rhs_buffer_state[0] != EMPTY && !lhs_start && !lhs_en;
     end
     //----------------------rhs_buffer logic--------------------------------
 
@@ -654,6 +678,7 @@ module SpMM(
     logic pe_out_cols_valid [`N-1:0];
     logic pe_out_cols_valid_delayed [`N-1:0]; // delay the PE valid flags for output
 
+    int delay, num_el; // placeholder vals 
     generate
         for(genvar i = 0; i < `N; i++) begin
             delay_shift #(.W(1), .DELAY_CYCLES(`delayPE)) pe_out_cols_valid_delay_shift(
@@ -671,8 +696,8 @@ module SpMM(
                 //.rhs(rhs_buffer[i]),
                 .rhs(rhs_buffer[0][i]),
                 .out(pe_out_cols[i]), // output column vectors
-                .delay(),
-                .num_el(),
+                .delay(delay),
+                .num_el(num_el),
                 .out_idx_valid(pe_out_cols_valid) // only output the valid value to buffer
             );
         end

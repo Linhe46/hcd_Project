@@ -662,8 +662,8 @@ int main() {
         new WSOutDbBuf(),
         new WSPipe(),
         new OSOnePass(),
-        // new OSPipe(),
-        // new WOSOnePass(),
+        new OSPipe(),
+        new WOSOnePass(),
     };
     int idx = 0;
     int score = 0;
