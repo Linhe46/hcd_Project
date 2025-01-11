@@ -369,8 +369,11 @@ module PE(
     data_t halo_sum;
     logic [`lgN-1:0] halo_id;
     data_t red_out [`N-1:0];
+    int delay_redu; // placeholder
     // instantiate RedUnit (1 additional delay from data's multiplication)
-    RedUnit #(.UPPER_DELAY(1)) PE_REDUNIT(.clock(clock), .reset(reset), .data(data), .split(split), .out_idx(out_idx), .out_data(red_out), .halo_sum(halo_sum));
+    RedUnit #(.UPPER_DELAY(1)) PE_REDUNIT(.clock(clock), .reset(reset),
+         .data(data), .split(split), .out_idx(out_idx), .out_data(red_out), 
+         .delay(delay_redu), .num_el(num_el), .halo_sum(halo_sum));
 
     // filter the invalid output
     logic out_idx_valid_reg [`N-1:0];
@@ -678,7 +681,7 @@ module SpMM(
     logic pe_out_cols_valid [`N-1:0];
     logic pe_out_cols_valid_delayed [`N-1:0]; // delay the PE valid flags for output
 
-    int delay, num_el; // placeholder vals 
+    int delay; // placeholder vals 
     generate
         for(genvar i = 0; i < `N; i++) begin
             delay_shift #(.W(1), .DELAY_CYCLES(`delayPE)) pe_out_cols_valid_delay_shift(
@@ -733,23 +736,56 @@ module SpMM(
                 out_buffer_state[i] <= out_buffer_next_state[i];
         end
     end
+
+    logic out_os_start, out_os_en;
+    logic [`lgN-1:0] out_os_ctr;
+    delay_shift #(.W(1), .DELAY_CYCLES(`delayPE))
+        delay_lhs_os_to_out_os(.clock(clock), .reset(reset), .in(lhs_os && lhs_start), .out(out_os_start));
+    StartDetector #(.Type(`Vector)) out_os_detector(.clock(clock), .reset(reset), 
+        .start(out_os_start), .en(out_os_en), .ctr_(out_os_ctr));
+
+    localparam NONE_OS = 0, GET_OS = 1, BUSY_OS = 2;
+    logic [1:0] os_state, os_next_state;
+    logic os_id;
+    always_ff @(posedge clock) begin
+        if(reset) os_state <= NONE_OS;
+        else os_state <= os_next_state;
+    end
+    always_comb begin
+        case(os_state)
+            NONE_OS: os_next_state = lhs_os && lhs_start ? GET_OS : NONE_OS;
+            GET_OS: os_next_state = out_col_start ? BUSY_OS : GET_OS;
+            BUSY_OS: os_next_state = lhs_os && lhs_start ? GET_OS : (out_col_ctr == `N-1 ? NONE_OS : BUSY_OS);
+        endcase
+    end
+    always_ff @(posedge clock) begin
+        if(reset) os_id <= 1;
+        else if(lhs_os && lhs_start) begin
+            if(!(out_buffer_state[0] == READY_OUTPUT && out_buffer_state[1] == READY_OUTPUT))
+                os_id <= 0;
+            else os_id <= 1;
+        end
+    end
+
     always_comb begin
         case(out_buffer_state[0])
             EMPTY : out_buffer_next_state[0] = out_dbbuf_update ? READY_OUTPUT : EMPTY;
-            READY_OUTPUT : out_buffer_next_state[0] = out_start ? BUSY_SENDOUT : READY_OUTPUT;
+            READY_OUTPUT : out_buffer_next_state[0] = out_start ? BUSY_SENDOUT : (out_os_start && out_buffer_state[1] == EMPTY ? BUSY_OFFLOAD : READY_OUTPUT);
+            BUSY_OFFLOAD : out_buffer_next_state[0] = out_col_ctr == `N-1 ? READY_OUTPUT : BUSY_OFFLOAD;
             BUSY_SENDOUT : out_buffer_next_state[0] = out_ptr == `N/4-1 ? EMPTY : BUSY_SENDOUT;
         endcase
         case(out_buffer_state[1])
-            EMPTY : out_buffer_next_state[1] = out_col_start ? BUSY_OFFLOAD : EMPTY;
+            EMPTY : out_buffer_next_state[1] = (out_col_start && !out_os_start)? BUSY_OFFLOAD : EMPTY;
             BUSY_OFFLOAD : out_buffer_next_state[1] = out_col_ctr == `N-1 ? READY_OUTPUT : BUSY_OFFLOAD;
-            READY_OUTPUT : out_buffer_next_state[1] = out_dbbuf_update ? EMPTY : READY_OUTPUT;
+            READY_OUTPUT : out_buffer_next_state[1] = out_dbbuf_update ? EMPTY : (out_col_start ? BUSY_OFFLOAD : READY_OUTPUT);
         endcase
     end  
 
     logic out_dbbuf_update;
-    assign out_dbbuf_update = out_buffer_state[1] == READY_OUTPUT && out_buffer_state[0] != READY_OUTPUT;
+    assign out_dbbuf_update = out_buffer_state[1] == READY_OUTPUT && out_buffer_state[0] == EMPTY;
 
     logic  out_wr_en, out_rd_en;
+    logic  out_wr_os_en;
 
     assign out_wr_en = out_col_en;
     assign out_rd_en = out_en;    
@@ -761,6 +797,8 @@ module SpMM(
                 if(reset) out_buffer[1][i][j] <= 0;
                 else if(out_wr_en && pe_out_cols_valid_delayed[i])
                     out_buffer[1][i][j] <= pe_out_cols[j][i];
+                else if(out_os_en && os_id == 1 && pe_out_cols_valid_delayed[i])
+                    out_buffer[1][i][j] <= out_buffer[1][i][j] + pe_out_cols[j][i];
                 else out_buffer[1][i][j] <= out_buffer[1][i][j];
             end
         end
@@ -774,6 +812,8 @@ module SpMM(
                     out_buffer[0][i][j] <= 0;
                 else if(out_dbbuf_update)
                     out_buffer[0][i][j] <= out_buffer[1][i][j];
+                else if(out_os_en && os_id == 0 && pe_out_cols_valid_delayed[i])
+                    out_buffer[0][i][j] <= out_buffer[0][i][j] + pe_out_cols[j][i];
                 else
                     out_buffer[0][i][j] <= out_buffer[0][i][j];
             end
@@ -801,7 +841,7 @@ module SpMM(
 
     always_ff @(posedge clock) begin
         if(reset) out_ready <= 0;
-        else out_ready <= out_buffer_state[0] == READY_OUTPUT && !out_start; 
+        else out_ready <= out_buffer_state[0] == READY_OUTPUT && !out_start && os_state == NONE_OS;
     end
 
     //----------------------out_dbbuf logic--------------------------------
