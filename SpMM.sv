@@ -142,7 +142,8 @@ module mux_nto2 #(parameter INPUT_NUM = 2)(
     end
 endmodule
 
-module RedUnitFAN (
+module RedUnitFAN #(parameter UPPER_DELAY = 0)
+(
     input logic                 clock,
                                 reset,
     input   data_t              data[`N-1:0],
@@ -159,6 +160,15 @@ module RedUnitFAN (
 
     // vector product size is `N
 
+    // delay one cycle for data multiplication
+    logic split_reg [`N-1:0];
+    generate
+        for(genvar i = 0; i < `N; i++) begin
+            delay_shift #(.W(1), .DELAY_CYCLES(UPPER_DELAY)) split_delay_shift(
+                .clock(clock), .reset(reset), .in(split[i]), .out(split_reg[i]));
+        end
+    endgenerate
+
     // VecID encoder
     logic [`lgN-1:0] VecID[`N-1:0];
     logic [`lgN-1:0] VecID_cnt;
@@ -166,7 +176,7 @@ module RedUnitFAN (
         VecID_cnt = 0;
         for(int i = 0; i < `N; i++) begin
             VecID[i] = VecID_cnt;
-            if(split[i])
+            if(split_reg[i])
                 VecID_cnt = VecID_cnt + 1;
         end
     end
@@ -222,11 +232,12 @@ module RedUnitFAN (
     // level i(i>1) adders: need an k-2 mux, k=2*i
     // N/4-1 muxex in total
     localparam numMuxes = `N/4-1; 
+    // numAdders sel for simplicity
+    // exposed for routing
+    logic [`lgN-1:0] left_sel [numAdders-1:0];
+    logic [`lgN-1:0] right_sel [numAdders-1:0];
     generate 
         if(numMuxes > 0) begin
-        // numAdders sel for simplicity
-        logic [`lgN-1:0] left_sel [numAdders-1:0];
-        logic [`lgN-1:0] right_sel [numAdders-1:0];
         // instantiate mux for adders at lvl > 1 and connect
         for(genvar i = 2; i < `lgN; i++) begin
             localparam adderLvl_i = i;
@@ -260,7 +271,40 @@ module RedUnitFAN (
     endgenerate
 
     //---------Adder Input Select Routing-------------
+    always_comb begin
+        for(int i = 0; i < numAdders; i++) begin
+            int wire_num = 2 * adderLvl[i];
+            // default output value
+            left_sel[i] = wire_num;
+            right_sel[i] = 0;
+            add_en[i] = 0;
+            bypass_en[i] = 0;
+            if(VecID[i] == VecID[i + 1])
+                add_en[i] = 1;
+            else if(adderLvl[i] == 0 && VecID[i] != VecID[i + 1])
+                bypass_en[i] = 1;
+            else if(adderLvl[i] > 1) begin
+                for(int j = 1; j < adderLvl[i]; j++) begin
+                    int distance = 1 << j;
+                    if(VecID[i - distance] != VecID[i]) begin
+                        int left_sel_wire = wire_num/2 - 1 + j; // j th wire from the middle
+                        // choose the smaller one as 'break'
+                        left_sel[i] = left_sel[i] > left_sel_wire ? left_sel_wire : left_sel[i];
+                    end
+                end
+                for(int j = 1; j < adderLvl[j]; j++) begin
+                    int distance = 1 << j;
+                    if(VecID[i + distance + 1] != VecID[i]) begin
+                        int right_sel_wire = wire_num/2 - j; // j the wire from the middle
+                        // choose the larger one as 'break'
+                        right_sel[i] = right_sel[i] < right_sel_wire ? right_sel_wire : right_sel[i];
+                    end
+                end
+            end
+        end
+    end
 
+    // collect output
 
 endmodule
 
@@ -533,7 +577,7 @@ module PE(
 
 
     data_t fan_red_out [`N-1:0];
-    RedUnitFAN PE_REDUNIT_FAN(.clock(clock), .reset(reset),
+    RedUnitFAN #(.UPPER_DELAY(1)) PE_REDUNIT_FAN(.clock(clock), .reset(reset),
          .data(data), .split(split), .out_idx(out_idx), .out_data(fan_red_out), 
          .delay(), .num_el(), .halo_sum());
 
