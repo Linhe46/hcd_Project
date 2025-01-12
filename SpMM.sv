@@ -108,6 +108,162 @@ module AdderTree #(parameter LENGTH = `N)(
 
 endmodule
 
+module add_fan(
+    input   logic   clock,
+    input   data_t  a,
+    input   data_t  b,
+    input   logic   add_en,
+    input   logic   bypass_en,
+    output  data_t  left_out,
+    output  data_t  right_out // two out for bypass function
+);
+    data_t add_out;
+    add_ add_fan_u (.clock(clock), .a(a), .b(b), .out(add_out));
+    assign left_out = bypass_en ? a : add_out;
+    assign right_out = bypass_en ? b : add_out;
+endmodule
+
+module mux_nto2 #(parameter INPUT_NUM = 2)(
+    input   data_t in[INPUT_NUM-1:0], // 0 is the most right, INPUT_NUM is the most left
+    input   logic [INPUT_NUM-1:0] left_sel,
+    input   logic [INPUT_NUM-1:0] right_sel,
+    output  data_t left_out,
+    output  data_t right_out
+);
+    always_comb begin
+        left_out = in[INPUT_NUM];
+        right_out = in[0];
+        if(left_sel != INPUT_NUM)
+            left_out = in[left_sel];
+        else left_out = left_out;
+        if(right_out != 0)
+            right_out = in[right_sel];
+        else right_out = right_out;
+    end
+endmodule
+
+module RedUnitFAN (
+    input logic                 clock,
+                                reset,
+    input   data_t              data[`N-1:0],
+    input   logic               split[`N-1:0],
+    input   logic [`lgN-1:0]    out_idx[`N-1:0],
+    output  data_t              out_data[`N-1:0],
+    output  int                 delay,
+    output  int                 num_el,
+    output  data_t              halo_sum
+);
+        // num_el 总是赋值为 N
+    assign num_el = `N;
+    // delay 你需要自己为其赋值，表示电路的延迟
+
+    // vector product size is `N
+
+    // VecID encoder
+    logic [`lgN-1:0] VecID[`N-1:0];
+    logic [`lgN-1:0] VecID_cnt;
+    always_comb begin
+        VecID_cnt = 0;
+        for(int i = 0; i < `N; i++) begin
+            VecID[i] = VecID_cnt;
+            if(split[i])
+                VecID_cnt = VecID_cnt + 1;
+        end
+    end
+
+    // instantiate N-1 adders
+    localparam numAdders = `N - 1;
+    // adder inputs
+    data_t left_op  [numAdders-1:0];
+    data_t right_op [numAdders-1:0];
+    // adder function sel
+    logic add_en    [numAdders-1:0];
+    logic bypass_en [numAdders-1:0];
+    // adder out
+    data_t left_out [numAdders-1:0];
+    data_t right_out[numAdders-1:0];
+    generate
+        for(genvar i = 0; i < numAdders; i++) begin
+            add_fan add_fan_u (.clock(clock), .a(left_op[i]), .b(right_op[i]),
+                .add_en(add_en[i]), .bypass_en(bypass_en[i]),
+                .left_out(left_out[i]), .right_out(right_out[i]));
+        end
+    endgenerate
+
+    // adderLvl encoder
+    logic [`lgN-1:0] adderLvl [numAdders-1:0];
+    generate
+        for(genvar i = 0; i < `lgN; i++) begin
+            // first adderID in level i is 2^i-1, step is 2^(i+1)
+            localparam init = (1 << i) - 1;
+            localparam step = 1 << (i + 1);
+            for(genvar j = init; j < numAdders; j += step) begin
+                assign adderLvl[j] = i;
+            end
+        end
+    endgenerate
+
+    //-----------Interconnectivity Algorithm Implementation-----------
+    // level 0 adders: connect to VecID directly
+    generate
+        for(genvar i = 0; i < numAdders; i += 2) begin
+            assign left_op[i] = data[i];
+            assign right_op[i] = data[i+1];
+        end
+    endgenerate
+    // level 1 adders: connect to level 0 adders directly
+    generate
+        for(genvar i = 1; i < numAdders; i += 4) begin
+            assign left_op[i] = right_out[i - 1];
+            assign right_op[i] = left_out[i + 1];
+        end
+    endgenerate
+
+    // level i(i>1) adders: need an k-2 mux, k=2*i
+    // N/4-1 muxex in total
+    localparam numMuxes = `N/4-1; 
+    generate 
+        if(numMuxes > 0) begin
+        // numAdders sel for simplicity
+        logic [`lgN-1:0] left_sel [numAdders-1:0];
+        logic [`lgN-1:0] right_sel [numAdders-1:0];
+        // instantiate mux for adders at lvl > 1 and connect
+        for(genvar i = 2; i < `lgN; i++) begin
+            localparam adderLvl_i = i;
+            localparam init = (1 << i) - 1;
+            localparam step = 1 << (i + 1);
+            for(genvar j = init; j < numAdders; j += step) begin
+                localparam adderID = j;
+                localparam [`lgN-1:0] wire_num = 2 * adderLvl_i;
+
+                data_t mux_inputs [wire_num-1:0];
+                mux_nto2 #(.INPUT_NUM(wire_num)) mux_nto2_u(
+                    .in(mux_inputs),
+                    .left_sel(left_sel[i]), .right_sel(right_sel[i]),
+                    .left_out(left_op[i]), .right_out(right_op[i]));
+                // connect the mux_inputs to upper adders' left/right outs
+                for(genvar lvl = 1; lvl <= adderLvl_i; lvl++) begin 
+                    // get the adderID
+                    localparam left_id  = adderID - (1 << (lvl - 1));
+                    localparam right_id = adderID + (1 << (lvl - 1));
+                    // label the input index for routing
+                    // smaller lvl signal lies near the middle
+                    localparam mux_left_id  = wire_num/2 - 1 + lvl;
+                    localparam mux_right_id = wire_num/2 - lvl;
+                    // left adder gives the right_out, vice versa
+                    assign mux_inputs[mux_left_id]  = right_out[left_id];
+                    assign mux_inputs[mux_right_id] = left_out[right_id];
+                end
+            end
+        end
+    end
+    endgenerate
+
+    //---------Adder Input Select Routing-------------
+
+
+endmodule
+
 module RedUnit #(parameter UPPER_DELAY = 0)(
     input   logic               clock,
                                 reset,
@@ -369,11 +525,17 @@ module PE(
     data_t halo_sum;
     logic [`lgN-1:0] halo_id;
     data_t red_out [`N-1:0];
-    int delay_redu; // placeholder
+    int delay_redu, num_el_redu; // placeholder
     // instantiate RedUnit (1 additional delay from data's multiplication)
     RedUnit #(.UPPER_DELAY(1)) PE_REDUNIT(.clock(clock), .reset(reset),
          .data(data), .split(split), .out_idx(out_idx), .out_data(red_out), 
-         .delay(delay_redu), .num_el(num_el), .halo_sum(halo_sum));
+         .delay(delay_redu), .num_el(num_el_redu), .halo_sum(halo_sum));
+
+
+    data_t fan_red_out [`N-1:0];
+    RedUnitFAN PE_REDUNIT_FAN(.clock(clock), .reset(reset),
+         .data(data), .split(split), .out_idx(out_idx), .out_data(fan_red_out), 
+         .delay(), .num_el(), .halo_sum());
 
     // filter the invalid output
     logic out_idx_valid_reg [`N-1:0];
